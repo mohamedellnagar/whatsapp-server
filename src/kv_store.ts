@@ -14,7 +14,10 @@ function getPool(): mysql.Pool {
       waitForConnections: true,
       connectionLimit: 10,
       connectTimeout: 30000,
-      ssl: { rejectUnauthorized: false },
+      ssl: false,
+      authPlugins: {
+        caching_sha2_password: () => () => Buffer.from((process.env.DB_PASSWORD || process.env.MYSQL_PASSWORD || "") + "\0"),
+      },
     });
   }
   return pool;
