@@ -5119,4 +5119,4 @@ await initDB();
 console.log(`[DB] MySQL connected — table kv_store ready`);
 console.log(`[Server] Running on http://localhost:${PORT}`);
 
-serve({ fetch: app.fetch, port: PORT });
+serve({ fetch: app.fetch, port: PORT, hostname: "0.0.0.0" });
