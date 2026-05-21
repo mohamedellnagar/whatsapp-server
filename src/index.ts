@@ -3532,15 +3532,17 @@ ${businessInfo ? `معلومات: ${businessInfo}` : ""}
 قائمة الأصناف المتاحة فقط (لا تذكر أي صنف خارج هذه القائمة):
 ${menuText}
 
-قواعد صارمة جداً:
-1. رد بنفس لغة العميل
-2. الرد لا يتجاوز جملتين
-3. لا تخترع أصناف أو أسعار أو خصومات غير موجودة في القائمة أعلاه
-4. لو طلب صنف غير موجود بالاسم الدقيق، ابحث عن الأقرب وأخبره باسمه وسعره الصحيح
-5. لو سأل عن خصومات وما في قائمة عليها 🏷️ → قل: "مفيش خصومات متاحة حالياً"
-6. لو أراد الطلب → قل اسم الصنف وسعره ثم اسأل: "الكمية والعنوان؟"
-7. لا تذكر أنك AI أو بوت
-8. لو القائمة تحتوي خصومات (علامة 🏷️) اذكر السعر بعد الخصم فقط`,
+قواعد صارمة:
+1. رد بنفس لغة العميل، جملة أو جملتين فقط
+2. لا تخترع أصناف أو أسعار أو خصومات غير موجودة في القائمة
+3. لو طلب صنف غير موجود، ابحث عن الأقرب وأخبره باسمه وسعره الصحيح
+4. لو سأل عن خصومات وما في 🏷️ → قل: "مفيش خصومات حالياً"
+5. لو أراد الطلب → أكد اسم الصنف وسعره وقل: "كمية والعنوان؟"
+6. لو عنده كمية وعنوان → أكد الطلب كاملاً
+7. لا تذكر أنك AI
+
+عند تأكيد الطلب النهائي فقط (لما تجمع الصنف والكمية والعنوان)، أضف في نهاية ردك:
+##ORDER:{"item":"اسم الصنف","qty":1,"price":0,"address":"العنوان","currency":"AED"}##`,
       },
     ];
 
@@ -3555,12 +3557,47 @@ ${menuText}
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model: "gpt-4o-mini", messages, max_tokens: 300, temperature: 0.7 }),
+      body: JSON.stringify({ model: "gpt-4o-mini", messages, max_tokens: 400, temperature: 0.5 }),
     });
 
     if (!response.ok) return null;
     const data = await response.json();
-    return data.choices?.[0]?.message?.content?.trim() || null;
+    let content = data.choices?.[0]?.message?.content?.trim() || null;
+    if (!content) return null;
+
+    // Save order if AI confirmed one
+    const orderMatch = content.match(/##ORDER:(\{.*?\})##/s);
+    if (orderMatch) {
+      try {
+        const orderData = JSON.parse(orderMatch[1]);
+        const conv = await kv.get(`conversation:${conversationId}`) as any;
+        const orderId = "AI" + Date.now().toString(36).toUpperCase();
+        const matchedProduct = products.find((p: any) =>
+          p.name?.includes(orderData.item) || orderData.item?.includes(p.name));
+        const unitPrice = orderData.price > 0 ? orderData.price : (matchedProduct?.price || 0);
+        const total = unitPrice * (orderData.qty || 1);
+        await kv.set(`order:${orderId}`, {
+          id: orderId,
+          conversation_id: conversationId,
+          customer_phone: conv?.customer_phone || "",
+          customer_name: customerName,
+          delivery_address: orderData.address || "",
+          items: [{ name: orderData.item, qty: orderData.qty || 1, price: unitPrice, currency: orderData.currency || "AED" }],
+          items_text: `${orderData.qty || 1}x ${orderData.item}`,
+          total_amount: total,
+          currency: orderData.currency || "AED",
+          status: "new",
+          created_at: new Date().toISOString(),
+          source: "ai_chat",
+        });
+        console.log(`[AI Order] ✅ Saved: ${orderId} — ${orderData.qty}x ${orderData.item} = ${total} ${orderData.currency}`);
+      } catch (e) {
+        console.log("[AI Order] Parse error:", e);
+      }
+      content = content.replace(/##ORDER:.*?##/s, "").trim();
+    }
+
+    return content;
   } catch (e) {
     console.log("[AI RestaurantReply] error:", e);
     return null;
