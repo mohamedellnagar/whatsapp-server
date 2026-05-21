@@ -3465,9 +3465,18 @@ async function generateRestaurantReply(conversationId: string, customerName: str
     // Get menu/products
     const products = await kv.getByPrefix("product:");
     const menuText = products.length > 0
-      ? products.map((p: any) =>
-          `- ${p.name}${p.price ? ` (${p.price} ${p.currency || ""})` : ""}${p.description ? `: ${p.description}` : ""}${p.available === false ? " [غير متاح]" : ""}`
-        ).join("\n")
+      ? products.map((p: any) => {
+          let priceStr = p.price ? `${p.price} ${p.currency || ""}` : "";
+          let discountStr = "";
+          if (p.discountType && p.discountValue) {
+            const finalPrice = p.discountType === "percent"
+              ? (p.price * (1 - p.discountValue / 100)).toFixed(2)
+              : (p.price - p.discountValue).toFixed(2);
+            discountStr = ` 🏷️ عرض: ${p.discountType === "percent" ? `خصم ${p.discountValue}%` : `خصم ${p.discountValue} ${p.currency || ""}`} → السعر بعد الخصم: ${finalPrice} ${p.currency || ""}`;
+            if (p.offerLabel) discountStr += ` (${p.offerLabel})`;
+          }
+          return `- ${p.name}${priceStr ? ` (${priceStr})` : ""}${p.description ? `: ${p.description}` : ""}${discountStr}${p.available === false ? " [غير متاح]" : ""}`;
+        }).join("\n")
       : "المنيو غير محدد بعد";
 
     // Get business info
