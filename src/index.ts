@@ -3952,6 +3952,27 @@ function formatPrice(price: number, currency: string): string {
   return `${price} ${currency}`;
 }
 
+function formatItemPrice(item: any): string {
+  const cur = item.currency || "AED";
+  if (item.discountType && item.discountValue) {
+    const final = item.discountType === "percent"
+      ? (item.price * (1 - item.discountValue / 100))
+      : (item.price - item.discountValue);
+    const label = item.discountType === "percent" ? `${item.discountValue}% خصم` : `خصم ${item.discountValue} ${cur}`;
+    return `~~${item.price} ${cur}~~ *${final.toFixed(2)} ${cur}* 🏷️ ${label}${item.offerLabel ? ` (${item.offerLabel})` : ""}`;
+  }
+  return formatPrice(item.price, cur);
+}
+
+function getDiscountedPrice(item: any): number {
+  if (item.discountType && item.discountValue) {
+    return item.discountType === "percent"
+      ? item.price * (1 - item.discountValue / 100)
+      : item.price - item.discountValue;
+  }
+  return item.price;
+}
+
 function buildCartSummary(cart: ChatState["cart"]): { text: string; total: number; currency: string } {
   if (cart.length === 0) return { text: "السلة فارغة", total: 0, currency: "AED" };
   const currency = cart[0]?.currency || "AED";
@@ -4007,7 +4028,7 @@ function menuStateMachine(
           const items = categories[categoryNames[0]];
           reply = `📋 *${categoryNames[0]}:*\n\n`;
           items.forEach((item: any, i: number) => {
-            reply += `*${i + 1}.* ${item.name} — ${formatPrice(item.price, item.currency || "AED")}`;
+            reply += `*${i + 1}.* ${item.name} — ${formatItemPrice(item)}`;
             if (item.description) reply += `\n   _${item.description}_`;
             reply += "\n\n";
           });
@@ -4019,7 +4040,11 @@ function menuStateMachine(
           st.state = "categories";
         }
       } else if (inputNorm === "2") {
-        reply = `❓ *الاستفسارات:*\n\n${bizInfo || "للاستفسار يرجى التواصل معنا مباشرة"}\n\n0️⃣ القائمة الرئيسية`;
+        const discountedItems = menuItems.filter((p: any) => p.discountType && p.discountValue);
+        const discountLine = discountedItems.length > 0
+          ? `\n\n🏷️ *العروض الحالية:*\n${discountedItems.map((p: any) => `• ${p.name}: ${formatItemPrice(p)}`).join("\n")}`
+          : "";
+        reply = `❓ *الاستفسارات:*\n\n${bizInfo || "للاستفسار يرجى التواصل معنا مباشرة"}${discountLine}\n\n0️⃣ القائمة الرئيسية`;
         st.state = "main_menu";
       } else if (inputNorm === "3" && st.cart.length > 0) {
         const { text, total, currency } = buildCartSummary(st.cart);
@@ -4040,7 +4065,7 @@ function menuStateMachine(
         const items = categories[catName];
         reply = `📋 *${catName}:*\n\n`;
         items.forEach((item: any, i: number) => {
-          reply += `*${i + 1}.* ${item.name} — ${formatPrice(item.price, item.currency || "AED")}`;
+          reply += `*${i + 1}.* ${item.name} — ${formatItemPrice(item)}`;
           if (item.description) reply += `\n   _${item.description}_`;
           reply += "\n\n";
         });
@@ -4054,7 +4079,7 @@ function menuStateMachine(
       const itemIdx = parseInt(inputNorm) - 1;
       if (itemIdx >= 0 && itemIdx < items.length) {
         const item = items[itemIdx];
-        reply = `كم واحد تبي من *${item.name}*? 🔢\n\nالسعر: ${formatPrice(item.price, item.currency || "AED")}\n\nاكتب العدد (1-20)\n0️⃣ إلغاء`;
+        reply = `كم واحد تبي من *${item.name}*? 🔢\n\nالسعر: ${formatItemPrice(item)}\n\nاكتب العدد (1-20)\n0️⃣ إلغاء`;
         st.state = `item_quantity:${catName}:${itemIdx}`;
       } else { reply = `⚠️ رقم غير صحيح. اختر من 1 إلى ${items.length}\n0️⃣ رجوع`; }
       break;
@@ -4067,7 +4092,8 @@ function menuStateMachine(
         const qty = parseInt(inputNorm);
         if (qty >= 1 && qty <= 20) {
           const existing = st.cart.find(c => c.name === item.name);
-          if (existing) { existing.qty += qty; } else { st.cart.push({ name: item.name, price: item.price, currency: item.currency || "AED", qty, category: catName }); }
+          const itemPrice = getDiscountedPrice(item);
+          if (existing) { existing.qty += qty; } else { st.cart.push({ name: item.name, price: itemPrice, currency: item.currency || "AED", qty, category: catName }); }
           const { total, currency } = buildCartSummary(st.cart);
           reply = `✅ تمت الإضافة! ${qty} × *${item.name}*\n\n🛒 السلة: ${st.cart.length} أصناف — ${formatPrice(total, currency)}\n\n1️⃣ إضافة أكثر 📋\n2️⃣ عرض السلة 🛒\n3️⃣ إتمام الطلب ✅\n0️⃣ القائمة الرئيسية`;
           st.state = "after_add";
@@ -4894,6 +4920,9 @@ async function syncProductsToAI() {
     const menuItems = available.map((p: any) => ({
       name: p.name, price: p.price, currency: p.currency || "AED",
       description: p.description || "", category: p.category || "",
+      discountType: p.discountType || null,
+      discountValue: p.discountValue || null,
+      offerLabel: p.offerLabel || null,
     }));
     const aiConfig = await kv.get("ai:config") as any;
     if (aiConfig) {
