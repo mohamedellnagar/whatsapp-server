@@ -4602,13 +4602,14 @@ app.get("/make-server-5c5dc789/products", async (c) => {
 app.post("/make-server-5c5dc789/products", async (c) => {
   try {
     const body = await c.req.json();
-    const { name, price, currency, description, category, imageUrl, available, id } = body;
+    const { name, price, currency, description, category, imageUrl, available, id,
+            discountType, discountValue, offerLabel } = body;
     if (!name || price === undefined) {
       return c.json({ error: "Product name and price are required" }, 400);
     }
     const productId = id || uuid();
     const existing = id ? await kv.get(`product:${id}`) as any : null;
-    const product = {
+    const product: any = {
       id: productId,
       name: name.trim(),
       price: parseFloat(price) || 0,
@@ -4620,6 +4621,16 @@ app.post("/make-server-5c5dc789/products", async (c) => {
       createdAt: existing?.createdAt || new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
+    // Discount fields
+    if (discountType) {
+      product.discountType = discountType;
+      product.discountValue = parseFloat(discountValue) || 0;
+      product.offerLabel = (offerLabel || "").trim();
+    } else {
+      product.discountType = null;
+      product.discountValue = null;
+      product.offerLabel = null;
+    }
     await kv.set(`product:${productId}`, product);
     await syncProductsToAI();
     console.log(`Product saved: ${productId} "${name}" ${price} ${currency || "AED"}`);
