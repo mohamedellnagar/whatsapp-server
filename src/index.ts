@@ -3451,6 +3451,73 @@ async function cancelAutoReply(conversationId: string): Promise<void> {
   await kv.del(`ai_pending:${conversationId}`);
 }
 
+// Generate a smart AI reply as a restaurant employee
+async function generateRestaurantReply(conversationId: string, customerName: string): Promise<string | null> {
+  try {
+    const apiKey = ((globalThis as any).process?.env?.OPENAI_API_KEY) || "";
+    if (!apiKey) return null;
+
+    // Get conversation history (last 10 messages)
+    const convMsgs = (await kv.getByPrefix(`cmsg:${conversationId}:`))
+      .sort((a: any, b: any) => new Date(a.sent_at).getTime() - new Date(b.sent_at).getTime())
+      .slice(-10);
+
+    // Get menu/products
+    const products = await kv.getByPrefix("product:");
+    const menuText = products.length > 0
+      ? products.map((p: any) =>
+          `- ${p.name}${p.price ? ` (${p.price} ${p.currency || ""})` : ""}${p.description ? `: ${p.description}` : ""}${p.available === false ? " [غير متاح]" : ""}`
+        ).join("\n")
+      : "المنيو غير محدد بعد";
+
+    // Get business info
+    const aiConf = await kv.get("ai:config") as any || {};
+    const businessName = aiConf.businessName || "المطعم";
+    const businessInfo = aiConf.businessInfo || "";
+
+    // Build conversation history for OpenAI
+    const messages: any[] = [
+      {
+        role: "system",
+        content: `أنت موظف خدمة عملاء محترف في ${businessName}. العميل اسمه: ${customerName || "العميل"}.
+${businessInfo ? `معلومات عن المطعم: ${businessInfo}` : ""}
+
+المنيو المتاح:
+${menuText}
+
+تعليمات:
+- رد باللغة التي يكتب بها العميل (عربي أو إنجليزي)
+- كن ودوداً ومفيداً كموظف حقيقي
+- لو العميل يسأل عن المنيو، اشرح الخيارات المتاحة
+- لو العميل يريد طلب، اسأله عن التفاصيل (الكمية، العنوان)
+- ردك يكون قصير وطبيعي (جملة أو جملتين)
+- لا تذكر أنك AI`,
+      },
+    ];
+
+    // Add conversation history
+    for (const msg of convMsgs) {
+      messages.push({
+        role: msg.direction === "inbound" ? "user" : "assistant",
+        content: msg.text || "(media)",
+      });
+    }
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model: "gpt-4o-mini", messages, max_tokens: 300, temperature: 0.7 }),
+    });
+
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.choices?.[0]?.message?.content?.trim() || null;
+  } catch (e) {
+    console.log("[AI RestaurantReply] error:", e);
+    return null;
+  }
+}
+
 // Background checker — runs every 60 seconds
 async function checkPendingAutoReplies(): Promise<void> {
   try {
@@ -3479,29 +3546,35 @@ async function checkPendingAutoReplies(): Promise<void> {
         continue;
       }
 
-      // Send AI reply via Evolution API
+      // Generate smart AI reply as restaurant employee
+      const aiReplyText = await generateRestaurantReply(item.conversationId, item.customerName);
+      if (!aiReplyText) {
+        console.log(`[AI AutoReply] No reply generated for ${item.phone}`);
+        await kv.del(`ai_pending:${item.conversationId}`);
+        continue;
+      }
+
+      // Send via Evolution API
       try {
         const evoConfig = await kv.get("evolution:config") as any;
         if (!evoConfig?.apiUrl || !evoConfig?.apiKey || !evoConfig?.instanceName) continue;
         const baseUrl = evoConfig.apiUrl.replace(/\/$/, "");
         const instanceEnc = encodeURIComponent(evoConfig.instanceName);
         const remoteJid = `${item.phone}@s.whatsapp.net`;
-        const payload = { number: remoteJid, text: item.suggestedReply };
-        const res = await evoFetch(baseUrl, evoConfig.apiKey, `/message/sendText/${instanceEnc}`, "POST", payload);
+        const res = await evoFetch(baseUrl, evoConfig.apiKey, `/message/sendText/${instanceEnc}`, "POST",
+          { number: remoteJid, text: aiReplyText });
 
         if (res.ok) {
-          console.log(`[AI AutoReply] ✅ Sent to ${item.phone}`);
-          // Save message to KV
+          console.log(`[AI AutoReply] ✅ Sent to ${item.phone}: "${aiReplyText.substring(0, 60)}"`);
           const msgId = uuid();
           await kv.set(`cmsg:${item.conversationId}:${msgId}`, {
             id: msgId, conversation_id: item.conversationId,
             direction: "outbound", sender_type: "ai",
-            text: item.suggestedReply, sent_at: new Date().toISOString(),
+            text: aiReplyText, sent_at: new Date().toISOString(),
           });
-          // Update conversation
           const conv = await kv.get(`conversation:${item.conversationId}`) as any;
           if (conv) {
-            conv.last_message_text = item.suggestedReply;
+            conv.last_message_text = aiReplyText;
             conv.last_message_direction = "outbound";
             conv.last_message_at = new Date().toISOString();
             await kv.set(`conversation:${item.conversationId}`, conv);
@@ -3519,8 +3592,22 @@ async function checkPendingAutoReplies(): Promise<void> {
   }
 }
 
-// Start background checker
-setInterval(checkPendingAutoReplies, 60 * 1000);
+// Start background checker every 30 seconds
+setInterval(() => {
+  checkPendingAutoReplies().catch(e => console.log("[AI AutoReply] interval error:", e));
+}, 30 * 1000);
+
+// Run once on startup after 10 seconds
+setTimeout(() => {
+  checkPendingAutoReplies().catch(e => console.log("[AI AutoReply] startup check error:", e));
+}, 10 * 1000);
+
+// GET /ai-autoresponse/check — manual trigger for testing
+app.get("/make-server-5c5dc789/ai-autoresponse/check", async (c) => {
+  await checkPendingAutoReplies();
+  const pending = await kv.getByPrefix("ai_pending:");
+  return c.json({ triggered: true, pendingCount: pending.length, pending });
+});
 
 // ─────────────────────────────────────────────
 // AI MESSAGE INTENT ANALYSIS
