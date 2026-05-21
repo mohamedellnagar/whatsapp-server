@@ -4575,6 +4575,37 @@ app.get("/make-server-5c5dc789/ai-diagnostics", async (c) => {
 });
 
 // ─────────────────────────────────────────────
+// AI MENU DEBUG — shows what the AI sees
+// ─────────────────────────────────────────────
+app.get("/make-server-5c5dc789/ai-menu-debug", async (c) => {
+  try {
+    const products = await kv.getByPrefix("product:");
+    const menuLines = products.map((p: any) => {
+      let discountStr = "";
+      if (p.discountType && p.discountValue) {
+        const finalPrice = p.discountType === "percent"
+          ? (p.price * (1 - p.discountValue / 100)).toFixed(2)
+          : (p.price - p.discountValue).toFixed(2);
+        discountStr = ` 🏷️ خصم ${p.discountValue}${p.discountType === "percent" ? "%" : ""} → ${finalPrice} ${p.currency || "AED"}`;
+        if (p.offerLabel) discountStr += ` (${p.offerLabel})`;
+      }
+      return {
+        name: p.name,
+        price: p.price,
+        discountType: p.discountType ?? null,
+        discountValue: p.discountValue ?? null,
+        offerLabel: p.offerLabel ?? null,
+        menuLine: `- ${p.name} (${p.price} ${p.currency || "AED"})${discountStr}`,
+      };
+    });
+    const hasDiscounts = menuLines.some((l: any) => l.discountType);
+    return c.json({ total: products.length, hasDiscounts, menuLines });
+  } catch (e) {
+    return c.json({ error: String(e) }, 500);
+  }
+});
+
+// ─────────────────────────────────────────────
 // AI AUTO-REPLY: Interactions Log
 // ─────────────────────────────────────────────
 // GET /intent/:conversationId — get AI intent analysis for a conversation
