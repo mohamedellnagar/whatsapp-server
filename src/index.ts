@@ -226,23 +226,56 @@ app.post("/make-server-5c5dc789/webhook/evolution", async (c) => {
       await kv.set(`conversation:${conversation.id}`, conversation);
       processedCount++;
 
-      // ── AI Analysis: intent + feedback for every inbound message ──
+      // ── AI Analysis + Auto-Reply ──
       if (!isFromMe && messageText) {
         Promise.race([
-          Promise.all([
-            analyzeMessageIntent(messageText, conversation.id, phone, pushName).then(async () => {
-              // Schedule auto-reply if AI says it needs a reply
-              const intent = await kv.get(`intent:${conversation.id}`) as any;
-              if (intent?.needsReply && intent?.suggestedReply) {
-                await scheduleAutoReply(conversation.id, phone, pushName, intent.suggestedReply);
+          (async () => {
+            const cfg = await kv.get("ai_autoresponse:config") as any;
+            const mode = cfg?.mode || (cfg?.enabled ? "delayed" : "off");
+
+            if (mode === "instant") {
+              // Instant: reply immediately without analysis
+              const replyText = await generateRestaurantReply(conversation.id, pushName);
+              if (replyText) {
+                const evoConfig = await kv.get("evolution:config") as any;
+                if (evoConfig?.apiUrl && evoConfig?.apiKey && evoConfig?.instanceName) {
+                  const baseUrl = evoConfig.apiUrl.replace(/\/$/, "");
+                  const instanceEnc = encodeURIComponent(evoConfig.instanceName);
+                  const res = await evoFetch(baseUrl, evoConfig.apiKey,
+                    `/message/sendText/${instanceEnc}`, "POST",
+                    { number: `${phone}@s.whatsapp.net`, text: replyText });
+                  if (res.ok) {
+                    const msgId = uuid();
+                    await kv.set(`cmsg:${conversation.id}:${msgId}`, {
+                      id: msgId, conversation_id: conversation.id,
+                      direction: "outbound", sender_type: "ai",
+                      text: replyText, sent_at: new Date().toISOString(),
+                    });
+                    conversation.last_message_text = replyText;
+                    conversation.last_message_direction = "outbound";
+                    conversation.last_message_at = new Date().toISOString();
+                    await kv.set(`conversation:${conversation.id}`, conversation);
+                    console.log(`[AI Instant] ✅ Sent to ${phone}`);
+                  }
+                }
               }
-            }),
-            analyzeMessageFeedback(messageText, conversation.id, phone, pushName),
-          ]),
-          new Promise<void>((resolve) => setTimeout(resolve, 15000)),
-        ]).catch((fbErr) => {
-          console.log(`[AI] ❌ Analysis error for ${phone}:`, fbErr);
-        });
+            } else {
+              // Delayed: analyze then schedule
+              await Promise.all([
+                analyzeMessageIntent(messageText, conversation.id, phone, pushName).then(async () => {
+                  if (mode === "delayed") {
+                    const intent = await kv.get(`intent:${conversation.id}`) as any;
+                    if (intent?.needsReply && intent?.suggestedReply) {
+                      await scheduleAutoReply(conversation.id, phone, pushName, intent.suggestedReply);
+                    }
+                  }
+                }),
+                analyzeMessageFeedback(messageText, conversation.id, phone, pushName),
+              ]);
+            }
+          })(),
+          new Promise<void>((resolve) => setTimeout(resolve, 20000)),
+        ]).catch((e) => console.log(`[AI] ❌ Error for ${phone}:`, e));
       }
 
       // ── Cancel auto-reply if employee sent an outbound message ──
@@ -3423,7 +3456,12 @@ app.get("/make-server-5c5dc789/ai-autoresponse/config", async (c) => {
 // POST /ai-autoresponse/config
 app.post("/make-server-5c5dc789/ai-autoresponse/config", async (c) => {
   const body = await c.req.json();
-  const cfg = { enabled: !!body.enabled, delayMinutes: Number(body.delayMinutes) || 10 };
+  // mode: "off" | "instant" | "delayed"
+  const cfg = {
+    enabled: body.mode !== "off",
+    mode: body.mode || (body.enabled ? "delayed" : "off"),
+    delayMinutes: Number(body.delayMinutes) || 10,
+  };
   await kv.set("ai_autoresponse:config", cfg);
   return c.json({ success: true, ...cfg });
 });
