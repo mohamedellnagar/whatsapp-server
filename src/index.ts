@@ -228,16 +228,26 @@ app.post("/make-server-5c5dc789/webhook/evolution", async (c) => {
 
       // ── AI Analysis: intent + feedback for every inbound message ──
       if (!isFromMe && messageText) {
-        // Run both analyses in parallel, don't block webhook response
         Promise.race([
           Promise.all([
-            analyzeMessageIntent(messageText, conversation.id, phone, pushName),
+            analyzeMessageIntent(messageText, conversation.id, phone, pushName).then(async () => {
+              // Schedule auto-reply if AI says it needs a reply
+              const intent = await kv.get(`intent:${conversation.id}`) as any;
+              if (intent?.needsReply && intent?.suggestedReply) {
+                await scheduleAutoReply(conversation.id, phone, pushName, intent.suggestedReply);
+              }
+            }),
             analyzeMessageFeedback(messageText, conversation.id, phone, pushName),
           ]),
           new Promise<void>((resolve) => setTimeout(resolve, 15000)),
         ]).catch((fbErr) => {
           console.log(`[AI] ❌ Analysis error for ${phone}:`, fbErr);
         });
+      }
+
+      // ── Cancel auto-reply if employee sent an outbound message ──
+      if (isFromMe) {
+        cancelAutoReply(conversation.id).catch(() => {});
       }
 
       // ── Menu Chatbot: trigger for inbound messages ──
@@ -3399,6 +3409,118 @@ app.post("/make-server-5c5dc789/ai-config", async (c) => {
     return c.json({ error: `Chatbot config save error: ${error}` }, 500);
   }
 });
+
+// ─────────────────────────────────────────────
+// AI AUTO-REPLY CONFIG & SCHEDULER
+// ─────────────────────────────────────────────
+
+// GET /ai-autoresponse/config
+app.get("/make-server-5c5dc789/ai-autoresponse/config", async (c) => {
+  const cfg = await kv.get("ai_autoresponse:config") as any || { enabled: false, delayMinutes: 10 };
+  return c.json(cfg);
+});
+
+// POST /ai-autoresponse/config
+app.post("/make-server-5c5dc789/ai-autoresponse/config", async (c) => {
+  const body = await c.req.json();
+  const cfg = { enabled: !!body.enabled, delayMinutes: Number(body.delayMinutes) || 10 };
+  await kv.set("ai_autoresponse:config", cfg);
+  return c.json({ success: true, ...cfg });
+});
+
+// Schedule auto-reply for a conversation
+async function scheduleAutoReply(
+  conversationId: string,
+  phone: string,
+  customerName: string,
+  suggestedReply: string
+): Promise<void> {
+  const cfg = await kv.get("ai_autoresponse:config") as any;
+  if (!cfg?.enabled) return;
+  const delayMs = (cfg.delayMinutes || 10) * 60 * 1000;
+  await kv.set(`ai_pending:${conversationId}`, {
+    conversationId, phone, customerName, suggestedReply,
+    scheduledAt: new Date().toISOString(),
+    fireAt: new Date(Date.now() + delayMs).toISOString(),
+  });
+  console.log(`[AI AutoReply] Scheduled for conv ${conversationId} in ${cfg.delayMinutes} min`);
+}
+
+// Cancel auto-reply when employee replies
+async function cancelAutoReply(conversationId: string): Promise<void> {
+  await kv.del(`ai_pending:${conversationId}`);
+}
+
+// Background checker — runs every 60 seconds
+async function checkPendingAutoReplies(): Promise<void> {
+  try {
+    const cfg = await kv.get("ai_autoresponse:config") as any;
+    if (!cfg?.enabled) return;
+
+    const pending = await kv.getByPrefix("ai_pending:");
+    const now = Date.now();
+
+    for (const item of pending) {
+      if (!item?.fireAt || !item?.conversationId) continue;
+      if (new Date(item.fireAt).getTime() > now) continue;
+
+      // Time to send AI reply
+      console.log(`[AI AutoReply] Firing for conv ${item.conversationId} → ${item.phone}`);
+
+      // Check if employee already replied after scheduling
+      const convMsgs = await kv.getByPrefix(`cmsg:${item.conversationId}:`);
+      const lastMsg = convMsgs.sort((a: any, b: any) =>
+        new Date(b.sent_at).getTime() - new Date(a.sent_at).getTime())[0];
+
+      if (lastMsg?.direction === "outbound") {
+        // Employee replied — cancel
+        await kv.del(`ai_pending:${item.conversationId}`);
+        console.log(`[AI AutoReply] Cancelled — employee already replied`);
+        continue;
+      }
+
+      // Send AI reply via Evolution API
+      try {
+        const evoConfig = await kv.get("evolution:config") as any;
+        if (!evoConfig?.apiUrl || !evoConfig?.apiKey || !evoConfig?.instanceName) continue;
+        const baseUrl = evoConfig.apiUrl.replace(/\/$/, "");
+        const instanceEnc = encodeURIComponent(evoConfig.instanceName);
+        const remoteJid = `${item.phone}@s.whatsapp.net`;
+        const payload = { number: remoteJid, text: item.suggestedReply };
+        const res = await evoFetch(baseUrl, evoConfig.apiKey, `/message/sendText/${instanceEnc}`, "POST", payload);
+
+        if (res.ok) {
+          console.log(`[AI AutoReply] ✅ Sent to ${item.phone}`);
+          // Save message to KV
+          const msgId = uuid();
+          await kv.set(`cmsg:${item.conversationId}:${msgId}`, {
+            id: msgId, conversation_id: item.conversationId,
+            direction: "outbound", sender_type: "ai",
+            text: item.suggestedReply, sent_at: new Date().toISOString(),
+          });
+          // Update conversation
+          const conv = await kv.get(`conversation:${item.conversationId}`) as any;
+          if (conv) {
+            conv.last_message_text = item.suggestedReply;
+            conv.last_message_direction = "outbound";
+            conv.last_message_at = new Date().toISOString();
+            await kv.set(`conversation:${item.conversationId}`, conv);
+          }
+        }
+      } catch (e) {
+        console.log(`[AI AutoReply] ❌ Send error:`, e);
+      }
+
+      // Remove pending
+      await kv.del(`ai_pending:${item.conversationId}`);
+    }
+  } catch (e) {
+    console.log("[AI AutoReply] checker error:", e);
+  }
+}
+
+// Start background checker
+setInterval(checkPendingAutoReplies, 60 * 1000);
 
 // ─────────────────────────────────────────────
 // AI MESSAGE INTENT ANALYSIS
