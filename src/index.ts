@@ -3618,6 +3618,57 @@ app.get("/make-server-5c5dc789/ai-autoresponse/check", async (c) => {
   return c.json({ triggered: true, pendingCount: pending.length, pending });
 });
 
+// POST /ai-autoresponse/reply-now — instant AI reply for a specific conversation
+app.post("/make-server-5c5dc789/ai-autoresponse/reply-now", async (c) => {
+  try {
+    const { conversationId } = await c.req.json();
+    if (!conversationId) return c.json({ error: "conversationId required" }, 400);
+
+    const conv = await kv.get(`conversation:${conversationId}`) as any;
+    if (!conv) return c.json({ error: "Conversation not found" }, 404);
+
+    const phone = conv.customer_phone;
+    const customerName = conv.customer_name || phone;
+
+    // Generate AI reply
+    const replyText = await generateRestaurantReply(conversationId, customerName);
+    if (!replyText) return c.json({ error: "AI could not generate a reply" }, 500);
+
+    // Send via Evolution API
+    const evoConfig = await kv.get("evolution:config") as any;
+    if (!evoConfig?.apiUrl || !evoConfig?.apiKey || !evoConfig?.instanceName) {
+      return c.json({ error: "Evolution API not configured" }, 400);
+    }
+    const baseUrl = evoConfig.apiUrl.replace(/\/$/, "");
+    const instanceEnc = encodeURIComponent(evoConfig.instanceName);
+    const remoteJid = `${phone}@s.whatsapp.net`;
+    const res = await evoFetch(baseUrl, evoConfig.apiKey, `/message/sendText/${instanceEnc}`, "POST",
+      { number: remoteJid, text: replyText });
+
+    if (!res.ok) return c.json({ error: "Failed to send message" }, 502);
+
+    // Save to KV
+    const msgId = uuid();
+    await kv.set(`cmsg:${conversationId}:${msgId}`, {
+      id: msgId, conversation_id: conversationId,
+      direction: "outbound", sender_type: "ai",
+      text: replyText, sent_at: new Date().toISOString(),
+    });
+    conv.last_message_text = replyText;
+    conv.last_message_direction = "outbound";
+    conv.last_message_at = new Date().toISOString();
+    await kv.set(`conversation:${conversationId}`, conv);
+
+    // Cancel any pending scheduled reply
+    await kv.del(`ai_pending:${conversationId}`);
+
+    console.log(`[AI ReplyNow] ✅ Sent to ${phone}: "${replyText.substring(0, 60)}"`);
+    return c.json({ success: true, reply: replyText });
+  } catch (error) {
+    return c.json({ error: `${error}` }, 500);
+  }
+});
+
 // ─────────────────────────────────────────────
 // AI MESSAGE INTENT ANALYSIS
 // ─────────────────────────────────────────────
