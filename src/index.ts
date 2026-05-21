@@ -3502,20 +3502,29 @@ async function generateRestaurantReply(conversationId: string, customerName: str
 
     // Get menu/products
     const products = await kv.getByPrefix("product:");
-    const menuText = products.length > 0
-      ? products.map((p: any) => {
-          let priceStr = p.price ? `${p.price} ${p.currency || ""}` : "";
-          let discountStr = "";
-          if (p.discountType && p.discountValue) {
-            const finalPrice = p.discountType === "percent"
-              ? (p.price * (1 - p.discountValue / 100)).toFixed(2)
-              : (p.price - p.discountValue).toFixed(2);
-            discountStr = ` 🏷️ عرض: ${p.discountType === "percent" ? `خصم ${p.discountValue}%` : `خصم ${p.discountValue} ${p.currency || ""}`} → السعر بعد الخصم: ${finalPrice} ${p.currency || ""}`;
-            if (p.offerLabel) discountStr += ` (${p.offerLabel})`;
-          }
-          return `- ${p.name}${priceStr ? ` (${priceStr})` : ""}${p.description ? `: ${p.description}` : ""}${discountStr}${p.available === false ? " [غير متاح]" : ""}`;
+    const availableProducts = products.filter((p: any) => p.available !== false);
+    const menuText = availableProducts.length > 0
+      ? availableProducts.map((p: any) => {
+          const priceStr = p.price ? `${p.price} ${p.currency || "AED"}` : "";
+          return `- ${p.name}${priceStr ? ` (${priceStr})` : ""}${p.description ? `: ${p.description}` : ""}`;
         }).join("\n")
       : "المنيو غير محدد بعد";
+
+    // Build explicit discounts section
+    const discountedProducts = availableProducts.filter((p: any) => p.discountType && p.discountValue);
+    const discountsSection = discountedProducts.length > 0
+      ? `العروض والخصومات المتاحة الآن:\n${discountedProducts.map((p: any) => {
+          const finalPrice = p.discountType === "percent"
+            ? (p.price * (1 - p.discountValue / 100)).toFixed(2)
+            : (p.price - p.discountValue).toFixed(2);
+          const discLabel = p.discountType === "percent"
+            ? `خصم ${p.discountValue}%`
+            : `خصم ${p.discountValue} ${p.currency || "AED"}`;
+          return `- ${p.name}: السعر الأصلي ${p.price} ${p.currency || "AED"} → بعد الخصم: ${finalPrice} ${p.currency || "AED"} (${discLabel})${p.offerLabel ? ` | ${p.offerLabel}` : ""}`;
+        }).join("\n")}`
+      : "لا توجد عروض أو خصومات حالياً.";
+
+    console.log(`[AI] Products: ${availableProducts.length}, discounted: ${discountedProducts.length}`);
 
     // Get business info
     const aiConf = await kv.get("ai:config") as any || {};
@@ -3529,17 +3538,18 @@ async function generateRestaurantReply(conversationId: string, customerName: str
         content: `أنت موظف في ${businessName}. اسم العميل: ${customerName || "العميل"}.
 ${businessInfo ? `معلومات: ${businessInfo}` : ""}
 
-قائمة الأصناف المتاحة فقط (لا تذكر أي صنف خارج هذه القائمة):
+قائمة الأصناف المتاحة (لا تذكر أي صنف خارج هذه القائمة):
 ${menuText}
+
+${discountsSection}
 
 قواعد صارمة:
 1. رد بنفس لغة العميل، جملة أو جملتين فقط
-2. لا تخترع أصناف أو أسعار أو خصومات غير موجودة في القائمة
-3. لو طلب صنف غير موجود، ابحث عن الأقرب وأخبره باسمه وسعره الصحيح
-4. لو سأل عن خصومات وما في 🏷️ → قل: "مفيش خصومات حالياً"
-5. لو أراد الطلب → أكد اسم الصنف وسعره وقل: "كمية والعنوان؟"
-6. لو عنده كمية وعنوان → أكد الطلب كاملاً
-7. لا تذكر أنك AI
+2. لا تخترع أصناف أو أسعار أو خصومات غير موجودة أعلاه
+3. لو سأل عن خصومات أو عروض: اذكر ما في قائمة العروض أعلاه حرفياً، لا تزيد ولا تنقص
+4. لو طلب صنف → أكد اسمه وسعره (بعد الخصم إن وجد) وقل: "كمية والعنوان؟"
+5. لو عنده كمية وعنوان → أكد الطلب كاملاً
+6. لا تذكر أنك AI
 
 عند تأكيد الطلب النهائي فقط (لما تجمع الصنف والكمية والعنوان)، أضف في نهاية ردك:
 ##ORDER:{"item":"اسم الصنف","qty":1,"price":0,"address":"العنوان","currency":"AED"}##`,
