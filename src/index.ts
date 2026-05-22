@@ -664,6 +664,99 @@ app.get("/make-server-5c5dc789/dashboard/analytics", async (c) => {
     const withinSLA = frtValues.filter(v => v <= slaTarget).length;
     const slaCompliance = frtValues.length > 0 ? Math.round((withinSLA / frtValues.length) * 100) : 0;
 
+    // ── Intent & Sentiment from intent: KV prefix ──
+    const intentRecords = await kv.getByPrefix("intent:");
+    // Filter to date if provided
+    const filteredIntents = dateParam
+      ? intentRecords.filter((r: any) => {
+          const d = r.analyzedAt ? new Date(r.analyzedAt).toISOString().slice(0, 10) : null;
+          return d === dateParam;
+        })
+      : intentRecords;
+
+    const intentBreakdown: Record<string, number> = {};
+    const urgencyBreakdown: Record<string, number> = { low: 0, medium: 0, high: 0 };
+    let sentimentPositive = 0, sentimentNeutral = 0, sentimentNegative = 0;
+    let totalIntentAnalyzed = 0;
+    const frtByIntent: Record<string, { total: number; count: number }> = {};
+
+    for (const r of filteredIntents) {
+      if (!r) continue;
+      totalIntentAnalyzed++;
+      const cat = r.category || r.intent || "other";
+      intentBreakdown[cat] = (intentBreakdown[cat] || 0) + 1;
+      const urg = r.urgency || r.intent_urgency || "low";
+      urgencyBreakdown[urg] = (urgencyBreakdown[urg] || 0) + 1;
+      // Derive sentiment from intent category
+      if (cat === "complaint") sentimentNegative++;
+      else if (cat === "order" || cat === "praise") sentimentPositive++;
+      else sentimentNeutral++;
+      // FRT by intent
+      if (!frtByIntent[cat]) frtByIntent[cat] = { total: 0, count: 0 };
+    }
+
+    // Also derive from conversation: prefix intent fields
+    const convIntentBreakdown: Record<string, number> = {};
+    for (const conv of conversations) {
+      if (!conv.intent) continue;
+      const convDate = conv.last_message_at ? new Date(conv.last_message_at).toISOString().slice(0, 10) : null;
+      if (dateParam && convDate !== dateParam) continue;
+      convIntentBreakdown[conv.intent] = (convIntentBreakdown[conv.intent] || 0) + 1;
+    }
+    // Merge
+    for (const [k, v] of Object.entries(convIntentBreakdown)) {
+      intentBreakdown[k] = Math.max(intentBreakdown[k] || 0, v);
+    }
+
+    // Sentiment from conversations
+    let convSentimentPos = 0, convSentimentNeu = 0, convSentimentNeg = 0;
+    for (const conv of conversations) {
+      const convDate = conv.last_message_at ? new Date(conv.last_message_at).toISOString().slice(0, 10) : null;
+      if (dateParam && convDate !== dateParam) continue;
+      if (conv.intent === "complaint" || conv.intent_urgency === "high") convSentimentNeg++;
+      else if (conv.intent === "order" || conv.intent === "praise") convSentimentPos++;
+      else convSentimentNeu++;
+    }
+    if (convSentimentPos + convSentimentNeu + convSentimentNeg > sentimentPositive + sentimentNeutral + sentimentNegative) {
+      sentimentPositive = convSentimentPos;
+      sentimentNeutral = convSentimentNeu;
+      sentimentNegative = convSentimentNeg;
+    }
+
+    // Customer response time patterns (how long customers take to reply)
+    const customerResponseTimes: number[] = [];
+    for (const conv of conversations) {
+      const convMsgs = messages
+        .filter((m: any) => m.conversation_id === conv.id)
+        .sort((a: any, b: any) => new Date(a.sent_at).getTime() - new Date(b.sent_at).getTime());
+      for (let i = 0; i < convMsgs.length - 1; i++) {
+        if (convMsgs[i].direction === "outbound" && convMsgs[i + 1].direction === "inbound") {
+          const rt = (new Date(convMsgs[i + 1].sent_at).getTime() - new Date(convMsgs[i].sent_at).getTime()) / 1000;
+          if (rt > 0 && rt < 86400 * 2) customerResponseTimes.push(rt);
+        }
+      }
+    }
+    const avgCustomerResponseTime = customerResponseTimes.length > 0
+      ? Math.round(customerResponseTimes.reduce((a, b) => a + b, 0) / customerResponseTimes.length)
+      : 0;
+
+    // Conversation outcome: orders converted vs. not
+    const orderConvs = conversations.filter((c: any) => {
+      if (dateParam) {
+        const d = c.last_message_at ? new Date(c.last_message_at).toISOString().slice(0, 10) : null;
+        return d === dateParam && c.intent === "order";
+      }
+      return c.intent === "order";
+    }).length;
+    const orders = await kv.getByPrefix("order:");
+    const ordersOnDate = dateParam
+      ? orders.filter((o: any) => {
+          const d = o.createdAt ? new Date(o.createdAt).toISOString().slice(0, 10) : null;
+          return d === dateParam;
+        })
+      : orders;
+    const orderConversionRate = orderConvs > 0 ? Math.round((ordersOnDate.length / orderConvs) * 100) : 0;
+
     return c.json({
       // Overview
       totalConversations,
@@ -674,13 +767,24 @@ app.get("/make-server-5c5dc789/dashboard/analytics", async (c) => {
       responseRate,
       busiestHour,
       statusBreakdown,
-      // FRT
+      // FRT (Staff response)
       avgFRT: Math.round(avgFRT),
       medianFRT: Math.round(medianFRT),
       totalResponsesSampled: frtValues.length,
       frtDistribution,
       slaTarget,
       slaCompliance,
+      // Customer behavior
+      avgCustomerResponseTime,
+      customerResponseSamples: customerResponseTimes.length,
+      // Intent & Sentiment
+      intentBreakdown,
+      urgencyBreakdown,
+      sentimentBreakdown: { positive: sentimentPositive, neutral: sentimentNeutral, negative: sentimentNegative },
+      // Orders
+      orderCount: ordersOnDate.length,
+      orderConvCount: orderConvs,
+      orderConversionRate,
       // Charts
       responseByHour: responseByHourChart,
       messageVolumeByHour,
