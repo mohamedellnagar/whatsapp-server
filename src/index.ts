@@ -2513,11 +2513,11 @@ app.post("/make-server-5c5dc789/evolution/sync", async (c) => {
       if (rawJid.includes("@s.whatsapp.net")) {
         phone = rawJid.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "");
       } else if (rawJid.includes("@lid")) {
-        // @lid JID — LID is WhatsApp's internal device ID, NOT a phone number.
-        // Try to resolve real phone from multiple sources:
-        // 1) remoteJidAlt on the lastMessage key
-        // 2) any @s.whatsapp.net JID inside lastMessage context
-        // 3) chat-level phone/number field
+        // @lid JID — LID is WhatsApp's internal device ID, NOT a real phone number.
+        // Strategy: try to resolve real phone from:
+        //   1) remoteJidAlt / participant on lastMessage key
+        //   2) chat-level phone/number fields
+        //   3) Fetch first messages using @lid JID and look for @s.whatsapp.net inside
         const altJid =
           chat.lastMessage?.key?.remoteJidAlt ||
           chat.lastMessage?.key?.participant ||
@@ -2527,9 +2527,40 @@ app.post("/make-server-5c5dc789/evolution/sync", async (c) => {
           phone = altJid.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "");
         } else if (/^[0-9]{7,}$/.test((altJid || "").replace(/[^0-9]/g, ""))) {
           phone = altJid.replace(/[^0-9]/g, "");
+        } else if (workingMsgEp) {
+          // Try fetching messages directly via @lid JID to resolve real phone
+          try {
+            const lidBody = workingMsgEp.bodyType === "key.remoteJid"
+              ? { where: { key: { remoteJid: rawJid } }, limit: 5 }
+              : workingMsgEp.bodyType === "remoteJid"
+              ? { where: { remoteJid: rawJid }, limit: 5 }
+              : { where: { key: { remoteJid: rawJid } }, limit: 5 };
+            const lidRes = await evoFetch(baseUrl, config.apiKey, workingMsgEp.path, "POST", lidBody);
+            if (lidRes.ok) {
+              const lidData = await lidRes.json();
+              const lidRecords = extractRecords(lidData);
+              // Look for @s.whatsapp.net in any message key
+              for (const msg of lidRecords) {
+                const msgJid = msg?.key?.remoteJid || msg?.remoteJid || "";
+                if (msgJid.includes("@s.whatsapp.net")) {
+                  phone = msgJid.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "");
+                  break;
+                }
+                // Also check participant
+                const part = msg?.key?.participant || msg?.participant || "";
+                if (part.includes("@s.whatsapp.net")) {
+                  phone = part.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "");
+                  break;
+                }
+              }
+            }
+          } catch (_) {}
+          if (!phone) {
+            console.log(`[Sync] Skipping @lid chat with no resolvable phone: ${rawJid}`);
+            continue;
+          }
         } else {
-          // LID numeric part is NOT a real phone — skip this chat
-          console.log(`[Sync] Skipping @lid chat with no resolvable phone: ${rawJid}`);
+          console.log(`[Sync] Skipping @lid chat (no endpoint to resolve): ${rawJid}`);
           continue;
         }
       } else {
@@ -2586,9 +2617,14 @@ app.post("/make-server-5c5dc789/evolution/sync", async (c) => {
 
           const method = workingMsgEp.bodyType.startsWith("get.") ? "GET" as const : "POST" as const;
 
-          // Determine which JID(s) to try: @s.whatsapp.net first, then original @lid if different
-          const jidsToTry = [remoteJid];
-          if (apiJid !== remoteJid && apiJid.includes("@")) jidsToTry.push(apiJid);
+          // Determine which JID(s) to try.
+          // For @lid chats: try the original @lid first (Evolution stores msgs by @lid),
+          // then fallback to @s.whatsapp.net.
+          // For @s.whatsapp.net chats: @s.whatsapp.net first, @lid as fallback.
+          const isLidChat = apiJid.includes("@lid");
+          const jidsToTry = isLidChat
+            ? [apiJid, remoteJid]          // @lid first for lid chats
+            : [remoteJid, ...(apiJid !== remoteJid && apiJid.includes("@") ? [apiJid] : [])];
 
           for (const jid of jidsToTry) {
             let currentPage = 1;
