@@ -3495,6 +3495,27 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
             skipPollBusy = false;
           }, 2000);
 
+          // ── Typing Simulation (Human Mode) ──────────────────────────────────
+          // Send "composing" presence before the message, then pause for a realistic
+          // typing duration based on message length. This mimics a real human typing.
+          if (humanMode) {
+            try {
+              const presenceJid = `${phoneFormatted}@s.whatsapp.net`;
+              // Start composing
+              await evoFetch(baseUrl, config.apiKey, `/chat/presence/${instanceEnc}`, "POST",
+                { number: presenceJid, options: { presence: "composing", delay: 1200 } });
+              // Wait: simulate typing time — ~40 chars/sec, min 1.5s max 6s
+              const typingMs = Math.min(6000, Math.max(1500,
+                Math.floor((currentMessage.length / 40) * 1000) + Math.floor(Math.random() * 800)
+              ));
+              await new Promise(r => setTimeout(r, typingMs));
+              // Stop composing (paused)
+              await evoFetch(baseUrl, config.apiKey, `/chat/presence/${instanceEnc}`, "POST",
+                { number: presenceJid, options: { presence: "paused", delay: 500 } });
+            } catch (_) { /* presence not supported — continue without it */ }
+          }
+          // ────────────────────────────────────────────────────────────────────
+
           try {
             if (imageUrl && imageUrl.trim().length > 0) {
               // Try raw number first, then with JID suffix as fallback
