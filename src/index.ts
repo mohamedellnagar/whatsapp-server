@@ -446,7 +446,26 @@ app.post("/make-server-5c5dc789/webhook/evolution", async (c) => {
         data?.key?.remoteJid || data?.remoteJid || data?.from ||
         data?.message?.key?.remoteJid || data?.jid ||
         data?.chatId || data?.chat || "";
-      const phone = remoteJid.replace(/@.*$/, "");
+      // Resolve phone: prefer @s.whatsapp.net, fallback for @lid (LID is NOT a real phone)
+      let phone = "";
+      if (remoteJid.includes("@s.whatsapp.net")) {
+        phone = remoteJid.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "");
+      } else if (remoteJid.includes("@lid")) {
+        // Try to get real phone from participant or alternate JID fields
+        const altJid =
+          data?.key?.participant || data?.participant ||
+          data?.message?.key?.participant || data?.phone || data?.number || "";
+        if (altJid.includes("@s.whatsapp.net")) {
+          phone = altJid.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "");
+        } else {
+          // LID without resolvable phone — skip
+          console.log(`[WEBHOOK] Skipping @lid with no resolvable phone: ${remoteJid}`);
+          skippedCount++;
+          continue;
+        }
+      } else {
+        phone = remoteJid.replace(/@.*$/, "").replace(/[^0-9]/g, "");
+      }
       const isFromMe = data?.key?.fromMe ?? data?.message?.key?.fromMe ?? data?.fromMe ?? false;
 
       console.log(`[WEBHOOK] Item: jid="${remoteJid}" phone="${phone}" fromMe=${isFromMe} keys=[${Object.keys(data || {}).join(",")}]`);
@@ -2494,11 +2513,25 @@ app.post("/make-server-5c5dc789/evolution/sync", async (c) => {
       if (rawJid.includes("@s.whatsapp.net")) {
         phone = rawJid.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "");
       } else if (rawJid.includes("@lid")) {
-        // @lid JID — try to get real phone from lastMessage.key.remoteJidAlt
-        const altJid = chat.lastMessage?.key?.remoteJidAlt || chat.lastMessage?.key?.remoteJid || "";
-        phone = altJid.includes("@s.whatsapp.net")
-          ? altJid.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "")
-          : rawJid.replace("@lid", "").replace(/[^0-9]/g, "");
+        // @lid JID — LID is WhatsApp's internal device ID, NOT a phone number.
+        // Try to resolve real phone from multiple sources:
+        // 1) remoteJidAlt on the lastMessage key
+        // 2) any @s.whatsapp.net JID inside lastMessage context
+        // 3) chat-level phone/number field
+        const altJid =
+          chat.lastMessage?.key?.remoteJidAlt ||
+          chat.lastMessage?.key?.participant ||
+          chat.lastMessage?.participant ||
+          chat.phone || chat.number || "";
+        if (altJid.includes("@s.whatsapp.net")) {
+          phone = altJid.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "");
+        } else if (/^[0-9]{7,}$/.test((altJid || "").replace(/[^0-9]/g, ""))) {
+          phone = altJid.replace(/[^0-9]/g, "");
+        } else {
+          // LID numeric part is NOT a real phone — skip this chat
+          console.log(`[Sync] Skipping @lid chat with no resolvable phone: ${rawJid}`);
+          continue;
+        }
       } else {
         phone = (chat.phone || chat.number || rawJid).replace(/[^0-9]/g, "");
       }
