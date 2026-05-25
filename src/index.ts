@@ -178,6 +178,139 @@ app.get("/make-server-5c5dc789/auth/status", async (c) => {
   return c.json({ needsSetup });
 });
 
+// ─────────────────────────────────────────────
+// USER MANAGEMENT (Admin only)
+// ─────────────────────────────────────────────
+
+/** Helper: require admin role */
+function requireAdmin(c: any): boolean {
+  const user = c.get("user") as JwtPayload | undefined;
+  return user?.role === "admin";
+}
+
+// List all users (passwords stripped)
+app.get("/make-server-5c5dc789/users", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "Forbidden — admin only" }, 403);
+  try {
+    const users = (await kv.getByPrefix("auth_user:") as any[]).map(({ passwordHash: _pw, ...rest }) => rest);
+    users.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    return c.json({ users });
+  } catch (e) { return c.json({ error: String(e) }, 500); }
+});
+
+// Create user
+app.post("/make-server-5c5dc789/users", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "Forbidden — admin only" }, 403);
+  try {
+    const { username, password, role = "viewer" } = await c.req.json();
+    if (!username?.trim() || !password || password.length < 6)
+      return c.json({ error: "Username and password (min 6 chars) required" }, 400);
+    if (!["admin", "viewer"].includes(role))
+      return c.json({ error: "Role must be admin or viewer" }, 400);
+
+    const users = await kv.getByPrefix("auth_user:") as any[];
+    if (users.find((u) => u.username === username.trim().toLowerCase()))
+      return c.json({ error: "Username already exists" }, 409);
+
+    const id = uuid();
+    const hash = await bcrypt.hash(password, 10);
+    const newUser = { id, username: username.trim().toLowerCase(), passwordHash: hash, role, createdAt: new Date().toISOString() };
+    await kv.set(`auth_user:${id}`, newUser);
+    const { passwordHash: _pw, ...safe } = newUser;
+    return c.json({ user: safe });
+  } catch (e) { return c.json({ error: String(e) }, 500); }
+});
+
+// Update user (username / role — NOT password)
+app.put("/make-server-5c5dc789/users/:id", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "Forbidden — admin only" }, 403);
+  try {
+    const { id } = c.req.param();
+    const existing = await kv.get(`auth_user:${id}`) as any;
+    if (!existing) return c.json({ error: "User not found" }, 404);
+
+    const { username, role } = await c.req.json();
+    if (role && !["admin", "viewer"].includes(role))
+      return c.json({ error: "Role must be admin or viewer" }, 400);
+
+    // Prevent removing last admin
+    if (existing.role === "admin" && role === "viewer") {
+      const users = await kv.getByPrefix("auth_user:") as any[];
+      const adminCount = users.filter((u) => u.role === "admin").length;
+      if (adminCount <= 1) return c.json({ error: "Cannot demote the last admin" }, 400);
+    }
+
+    // Check username uniqueness if changing
+    if (username && username.trim().toLowerCase() !== existing.username) {
+      const users = await kv.getByPrefix("auth_user:") as any[];
+      if (users.find((u) => u.username === username.trim().toLowerCase()))
+        return c.json({ error: "Username already taken" }, 409);
+    }
+
+    const updated = {
+      ...existing,
+      username: username ? username.trim().toLowerCase() : existing.username,
+      role: role || existing.role,
+      updatedAt: new Date().toISOString(),
+    };
+    await kv.set(`auth_user:${id}`, updated);
+    const { passwordHash: _pw, ...safe } = updated;
+    return c.json({ user: safe });
+  } catch (e) { return c.json({ error: String(e) }, 500); }
+});
+
+// Change password (admin can change any; user can only change own)
+app.post("/make-server-5c5dc789/users/:id/change-password", async (c) => {
+  const caller = c.get("user") as JwtPayload;
+  try {
+    const { id } = c.req.param();
+    // Allow if admin OR changing own password
+    if (caller.role !== "admin" && caller.userId !== id)
+      return c.json({ error: "Forbidden" }, 403);
+
+    const existing = await kv.get(`auth_user:${id}`) as any;
+    if (!existing) return c.json({ error: "User not found" }, 404);
+
+    const { currentPassword, newPassword } = await c.req.json();
+    if (!newPassword || newPassword.length < 6)
+      return c.json({ error: "New password must be at least 6 characters" }, 400);
+
+    // Non-admins must verify current password
+    if (caller.role !== "admin") {
+      if (!currentPassword) return c.json({ error: "Current password required" }, 400);
+      const match = await bcrypt.compare(currentPassword, existing.passwordHash);
+      if (!match) return c.json({ error: "Current password is incorrect" }, 401);
+    }
+
+    const hash = await bcrypt.hash(newPassword, 10);
+    await kv.set(`auth_user:${id}`, { ...existing, passwordHash: hash, updatedAt: new Date().toISOString() });
+    return c.json({ ok: true });
+  } catch (e) { return c.json({ error: String(e) }, 500); }
+});
+
+// Delete user
+app.delete("/make-server-5c5dc789/users/:id", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "Forbidden — admin only" }, 403);
+  try {
+    const { id } = c.req.param();
+    const caller = c.get("user") as JwtPayload;
+    if (caller.userId === id) return c.json({ error: "Cannot delete your own account" }, 400);
+
+    const existing = await kv.get(`auth_user:${id}`) as any;
+    if (!existing) return c.json({ error: "User not found" }, 404);
+
+    // Prevent deleting last admin
+    if (existing.role === "admin") {
+      const users = await kv.getByPrefix("auth_user:") as any[];
+      const adminCount = users.filter((u) => u.role === "admin").length;
+      if (adminCount <= 1) return c.json({ error: "Cannot delete the last admin" }, 400);
+    }
+
+    await kv.del(`auth_user:${id}`);
+    return c.json({ ok: true });
+  } catch (e) { return c.json({ error: String(e) }, 500); }
+});
+
 // Health check
 app.get("/make-server-5c5dc789/health", (c) => {
   return c.json({ status: "ok" });
