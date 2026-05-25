@@ -3410,6 +3410,8 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
           let lastError = "";
           let wasSkipped = false;
           let sentMsgId = "";
+          let networkRetryCount = 0;
+          const MAX_NETWORK_RETRIES = 2;
 
           // Send with 30s timeout + skip/stop polling
           const ac = new AbortController();
@@ -3486,8 +3488,30 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
                     break;
                   } else {
                     lastError = e.message || String(e);
+                    // Network error retry: wait 5s and retry up to MAX_NETWORK_RETRIES
+                    const isNetErr = lastError.toLowerCase().includes("network") || lastError.toLowerCase().includes("fetch failed") || lastError.toLowerCase().includes("econnreset") || lastError.toLowerCase().includes("etimedout");
+                    if (isNetErr && networkRetryCount < MAX_NETWORK_RETRIES) {
+                      networkRetryCount++;
+                      console.log(`[BulkStream] Network error on ${rawPhone}, retry #${networkRetryCount} in 5s...`);
+                      await new Promise(r => setTimeout(r, 5000));
+                      // retry same payload
+                      try {
+                        const retryRes = await evoFetch(baseUrl, config.apiKey, `/message/sendText/${instanceEnc}`, "POST", payload, ac.signal);
+                        if (retryRes.ok) {
+                          sent = true;
+                          try { const rd = await retryRes.json(); sentMsgId = rd?.key?.id || rd?.message?.key?.id || ""; } catch {}
+                          lastError = "";
+                        } else {
+                          const errText = await retryRes.text();
+                          lastError = `${retryRes.status}: ${errText.substring(0, 100)}`;
+                        }
+                      } catch (retryErr: any) {
+                        lastError = retryErr.message || String(retryErr);
+                      }
+                    }
                   }
                 }
+                if (sent) break;
               }
             }
           } finally {
@@ -3530,7 +3554,13 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
             results.push({ phone: rawPhone, success: false, error: lastError || "Unknown error", skipped: wasSkipped, messageUsed: currentMessage });
             // Track consecutive connection errors for auto-stop
             const lowerErr = (lastError || "").toLowerCase();
-            if (lowerErr.includes("connection closed") || lowerErr.includes("connection reset") || lowerErr.includes("connection refused") || lowerErr.includes("econnreset") || lowerErr.includes("socket hang up")) {
+            if (
+              lowerErr.includes("connection closed") || lowerErr.includes("connection reset") ||
+              lowerErr.includes("connection refused") || lowerErr.includes("econnreset") ||
+              lowerErr.includes("socket hang up") || lowerErr.includes("network error") ||
+              lowerErr.includes("fetch failed") || lowerErr.includes("etimedout") ||
+              lowerErr.includes("enotfound") || lowerErr.includes("econnrefused")
+            ) {
               consecutiveConnectionErrors++;
               console.log(`[BulkStream] Connection error #${consecutiveConnectionErrors}: ${lastError}`);
             } else if (!wasSkipped) {
