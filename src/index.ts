@@ -3132,6 +3132,13 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
       batchRestMax = 120,
       messageVariants = [] as string[],
       shuffleNumbers = false,
+      // Anti-ban options
+      safeHoursOnly = false,
+      safeHoursStart = 9,
+      safeHoursEnd = 21,
+      safeHoursTimezone = "Asia/Riyadh",
+      validateNumbers = false,
+      openChatBeforeSend = false,
     } = body;
 
     if (!Array.isArray(phoneNumbers) || phoneNumbers.length === 0) {
@@ -3187,8 +3194,61 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
       }
     } catch {}
 
+    // ── 1) Safe Hours Check ───────────────────────────────────────────────────
+    if (safeHoursOnly) {
+      const nowInTZ = new Date().toLocaleString("en-US", { timeZone: safeHoursTimezone });
+      const localHour = new Date(nowInTZ).getHours();
+      if (localHour < safeHoursStart || localHour >= safeHoursEnd) {
+        return c.json({
+          error: `⏰ خارج أوقات الإرسال الآمنة (${safeHoursStart}:00 – ${safeHoursEnd}:00 بتوقيت ${safeHoursTimezone}). الساعة الحالية: ${localHour}:00.\nالإرسال في هذا الوقت يرفع خطر الحظر. جرّب مجدداً خلال أوقات العمل.`,
+        }, 400);
+      }
+    }
+
+    // ── 2) Validate Numbers (WhatsApp existence check) ────────────────────────
+    let validatedPhones: Set<string> | null = null;
+    if (validateNumbers && humanMode) {
+      try {
+        const cleanNums = phoneNumbers.map((p: string) => p.replace(/[^0-9]/g, "")).filter((p: string) => p.length >= 7);
+        // Evolution API can check up to 50 numbers at a time
+        const BATCH = 50;
+        validatedPhones = new Set<string>();
+        for (let vi = 0; vi < cleanNums.length; vi += BATCH) {
+          const chunk = cleanNums.slice(vi, vi + BATCH);
+          try {
+            const res = await evoFetch(baseUrl, config.apiKey, `/chat/whatsappNumbers/${instanceEnc}`, "POST", { numbers: chunk });
+            if (res.ok) {
+              const data = await res.json();
+              const results: any[] = Array.isArray(data) ? data : (data?.numbers || data?.data || []);
+              for (const r of results) {
+                const exists = r?.exists ?? r?.onWhatsApp ?? r?.registered ?? false;
+                const num = (r?.number || r?.jid || "").replace(/[^0-9]/g, "");
+                if (exists && num) validatedPhones.add(num);
+              }
+            } else {
+              // If endpoint fails, skip validation to avoid blocking send
+              validatedPhones = null;
+              break;
+            }
+          } catch { validatedPhones = null; break; }
+        }
+        if (validatedPhones) {
+          const beforeCount = cleanNums.length;
+          const afterCount = validatedPhones.size;
+          console.log(`[BulkStream] Number validation: ${afterCount}/${beforeCount} exist on WhatsApp`);
+        }
+      } catch { validatedPhones = null; }
+    }
+
     // Optionally shuffle numbers for human mode
     let finalPhoneNumbers = [...phoneNumbers];
+    // Filter to only validated numbers if check succeeded
+    if (validatedPhones) {
+      finalPhoneNumbers = finalPhoneNumbers.filter((p: string) => {
+        const clean = p.replace(/[^0-9]/g, "");
+        return validatedPhones!.has(clean);
+      });
+    }
     if (humanMode && shuffleNumbers) {
       for (let ii = finalPhoneNumbers.length - 1; ii > 0; ii--) {
         const jj = Math.floor(Math.random() * (ii + 1));
@@ -3494,6 +3554,19 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
             } catch { /* ignore KV errors in poll */ }
             skipPollBusy = false;
           }, 2000);
+
+          // ── 3) Open Chat Before Send ─────────────────────────────────────────
+          // Mark the chat as read (simulates opening the conversation before typing).
+          // This mimics a human who opens a chat, reads it, then starts typing.
+          if (humanMode && openChatBeforeSend) {
+            try {
+              const chatJid = `${phoneFormatted}@s.whatsapp.net`;
+              await evoFetch(baseUrl, config.apiKey, `/chat/markMessageAsRead/${instanceEnc}`, "POST",
+                { readMessages: [{ remoteJid: chatJid, fromMe: false, id: "last" }] });
+              // Brief pause after "opening" chat — 0.5–1.5s
+              await new Promise(r => setTimeout(r, 500 + Math.floor(Math.random() * 1000)));
+            } catch (_) { /* not supported — continue */ }
+          }
 
           // ── Typing Simulation (Human Mode) ──────────────────────────────────
           // Send "composing" presence before the message, then pause for a realistic
