@@ -6,9 +6,13 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import * as kv from "./kv_store.js";
 import { initDB } from "./kv_store.js";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 
 // WhatsApp Analytics Dashboard Backend — v2
-const app = new Hono();
+interface JwtPayload { userId: string; username: string; role: string; }
+type AppVariables = { user: JwtPayload };
+const app = new Hono<{ Variables: AppVariables }>();
 
 app.use("*", logger(console.log));
 
@@ -16,12 +20,80 @@ app.use(
   "/*",
   cors({
     origin: "*",
-    allowHeaders: ["Content-Type", "Authorization"],
+    allowHeaders: ["Content-Type", "Authorization", "X-API-Key"],
     allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     exposeHeaders: ["Content-Length"],
     maxAge: 600,
   })
 );
+
+// ─────────────────────────────────────────────
+// AUTH — JWT helpers
+// ─────────────────────────────────────────────
+const JWT_SECRET = process.env.JWT_SECRET || "wad-jwt-secret-change-me";
+const JWT_EXPIRES = "7d";
+
+function signToken(payload: JwtPayload): string {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES });
+}
+
+function verifyToken(token: string): JwtPayload | null {
+  try {
+    return jwt.verify(token, JWT_SECRET) as JwtPayload;
+  } catch {
+    return null;
+  }
+}
+
+function extractToken(c: any): string | null {
+  const auth = c.req.header("Authorization") || "";
+  if (auth.startsWith("Bearer ")) return auth.slice(7);
+  return c.req.query("token") || null;
+}
+
+// ─────────────────────────────────────────────
+// API KEY MIDDLEWARE — protects all dashboard routes
+// Webhook is exempt (Evolution API can't send custom headers easily)
+// ─────────────────────────────────────────────
+const DASHBOARD_API_KEY = process.env.DASHBOARD_API_KEY || "";
+
+app.use("/make-server-5c5dc789/*", async (c, next) => {
+  // Skip OPTIONS preflight
+  if (c.req.method === "OPTIONS") return next();
+  const path = c.req.path;
+
+  // ── Always exempt: webhook & health ──
+  if (path.includes("/webhook/evolution") || path.endsWith("/health")) {
+    return next();
+  }
+
+  // ── Always exempt: auth endpoints (login doesn't need a token yet) ──
+  if (path.includes("/auth/login") || path.includes("/auth/setup") || path.includes("/auth/status")) {
+    return next();
+  }
+
+  // ── API Key check (server-to-server, optional layer) ──
+  if (DASHBOARD_API_KEY) {
+    const provided = c.req.header("X-API-Key") || c.req.query("apiKey");
+    if (provided !== DASHBOARD_API_KEY) {
+      return c.json({ error: "Unauthorized — invalid or missing API key" }, 401);
+    }
+  }
+
+  // ── JWT check: require valid Bearer token ──
+  const token = extractToken(c);
+  if (!token) {
+    return c.json({ error: "Unauthorized — please log in", code: "NO_TOKEN" }, 401);
+  }
+  const payload = verifyToken(token);
+  if (!payload) {
+    return c.json({ error: "Unauthorized — session expired, please log in again", code: "INVALID_TOKEN" }, 401);
+  }
+
+  // Attach user to context for downstream handlers
+  c.set("user", payload);
+  return next();
+});
 
 // Helper: generate UUID
 function uuid(): string {
@@ -34,6 +106,77 @@ function todayStart(): string {
   d.setHours(0, 0, 0, 0);
   return d.toISOString();
 }
+
+// ─────────────────────────────────────────────
+// AUTH ENDPOINTS
+// ─────────────────────────────────────────────
+
+/** Check if any admin user exists */
+async function hasAnyUser(): Promise<boolean> {
+  try {
+    const users = await kv.getByPrefix("auth_user:");
+    return (users as any[]).length > 0;
+  } catch { return false; }
+}
+
+/** First-time setup — create the initial admin (only if no users exist) */
+app.post("/make-server-5c5dc789/auth/setup", async (c) => {
+  try {
+    if (await hasAnyUser()) {
+      return c.json({ error: "Setup already completed. Use login instead." }, 400);
+    }
+    const { username, password } = await c.req.json();
+    if (!username?.trim() || !password || password.length < 6) {
+      return c.json({ error: "Username and password (min 6 chars) are required." }, 400);
+    }
+    const id = uuid();
+    const hash = await bcrypt.hash(password, 10);
+    await kv.set(`auth_user:${id}`, {
+      id, username: username.trim().toLowerCase(),
+      passwordHash: hash, role: "admin",
+      createdAt: new Date().toISOString(),
+    });
+    const token = signToken({ userId: id, username: username.trim().toLowerCase(), role: "admin" });
+    return c.json({ token, username: username.trim().toLowerCase(), role: "admin" });
+  } catch (e) {
+    return c.json({ error: String(e) }, 500);
+  }
+});
+
+/** Login */
+app.post("/make-server-5c5dc789/auth/login", async (c) => {
+  try {
+    const { username, password } = await c.req.json();
+    if (!username || !password) {
+      return c.json({ error: "Username and password are required." }, 400);
+    }
+    const users = await kv.getByPrefix("auth_user:") as any[];
+    const user = users.find((u) => u.username === username.trim().toLowerCase());
+    if (!user) {
+      return c.json({ error: "Invalid username or password." }, 401);
+    }
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) {
+      return c.json({ error: "Invalid username or password." }, 401);
+    }
+    const token = signToken({ userId: user.id, username: user.username, role: user.role });
+    return c.json({ token, username: user.username, role: user.role });
+  } catch (e) {
+    return c.json({ error: String(e) }, 500);
+  }
+});
+
+/** Verify current token */
+app.get("/make-server-5c5dc789/auth/me", async (c) => {
+  const user = c.get("user");
+  return c.json({ userId: user.userId, username: user.username, role: user.role });
+});
+
+/** Check if setup is needed */
+app.get("/make-server-5c5dc789/auth/status", async (c) => {
+  const needsSetup = !(await hasAnyUser());
+  return c.json({ needsSetup });
+});
 
 // Health check
 app.get("/make-server-5c5dc789/health", (c) => {
@@ -91,14 +234,56 @@ app.post("/make-server-5c5dc789/webhook/evolution", async (c) => {
       "connection.update", "CONNECTION_UPDATE", "qrcode.updated",
       "presence.update", "PRESENCE_UPDATE", "chats.set", "CHATS_SET",
       "contacts.update", "CONTACTS_UPDATE", "groups.upsert", "GROUPS_UPSERT",
-      // Status updates (read/delivered) — not actual messages
-      "messages.update", "MESSAGES_UPDATE",
-      "message.update", "MESSAGE_UPDATE",
       "send.message", "SEND_MESSAGE",
     ];
     if (ignoredEvents.includes(event)) {
       console.log(`[WEBHOOK] Event "${event}" ignored`);
       return c.json({ status: "ok", note: `event ${event} ignored` });
+    }
+
+    // ── Bulk Campaign Analytics: delivery / read receipts ──
+    // Evolution API sends messages.update when WhatsApp delivers or reads a message
+    if (["messages.update", "MESSAGES_UPDATE", "message.update", "MESSAGE_UPDATE"].includes(event)) {
+      try {
+        const items = Array.isArray(payload.data) ? payload.data : [payload.data || payload];
+        for (const item of items) {
+          const msgId = item?.key?.id || item?.id;
+          const statusRaw = item?.update?.status ?? item?.status ?? item?.update?.message?.status;
+          // WhatsApp ACK codes: 2=SERVER_ACK, 3=DELIVERY_ACK, 4=READ, 5=PLAYED
+          const statusNum = typeof statusRaw === "number" ? statusRaw : 0;
+          const statusStr = (typeof statusRaw === "string" ? statusRaw : "").toUpperCase();
+          const isDelivered = statusNum >= 3 || statusStr === "DELIVERY_ACK" || statusStr === "DELIVERED";
+          const isRead = statusNum >= 4 || statusStr === "READ" || statusStr === "VIEWED";
+
+          if (!msgId || (!isDelivered && !isRead)) continue;
+
+          // Look up which campaign this message belongs to
+          const mapping = await kv.get(`bulk_msgid:${msgId}`) as any;
+          if (!mapping?.campaignId) continue;
+
+          const statsKey = `bulk_stats:${mapping.campaignId}`;
+          const stats = (await kv.get(statsKey)) as any || { campaignId: mapping.campaignId, delivered: 0, read: 0, replied: 0, deliveredPhones: [], readPhones: [], repliedPhones: [] };
+
+          if (isRead && !stats.readPhones.includes(mapping.phone)) {
+            stats.read++;
+            stats.readPhones.push(mapping.phone);
+            // Implicitly delivered if read
+            if (!stats.deliveredPhones.includes(mapping.phone)) {
+              stats.delivered++;
+              stats.deliveredPhones.push(mapping.phone);
+            }
+          } else if (isDelivered && !stats.deliveredPhones.includes(mapping.phone)) {
+            stats.delivered++;
+            stats.deliveredPhones.push(mapping.phone);
+          }
+
+          await kv.set(statsKey, stats);
+          console.log(`[BulkAnalytics] ${isRead ? "READ" : "DELIVERED"} msg=${msgId} campaign=${mapping.campaignId} delivered=${stats.delivered} read=${stats.read}`);
+        }
+      } catch (e) {
+        console.log("[BulkAnalytics] messages.update error:", e);
+      }
+      return c.json({ status: "ok", note: "message status processed" });
     }
 
     // Evolution API: data can be in many places depending on version
@@ -225,6 +410,40 @@ app.post("/make-server-5c5dc789/webhook/evolution", async (c) => {
       conversation.msg_count = (conversation.msg_count || 0) + 1;
       await kv.set(`conversation:${conversation.id}`, conversation);
       processedCount++;
+
+      // ── Auto-add to Customer List if not already there ──
+      if (!isFromMe && phone) {
+        try {
+          const existingCustomerId = await kv.get(`customer_phone:${phone}`);
+          if (!existingCustomerId) {
+            const customerName = (pushName && pushName !== "Customer") ? pushName : phone;
+            await upsertCustomer({ name: customerName, phone, source: "whatsapp_auto" });
+            console.log(`[Customers] Auto-added new customer: ${phone} (${customerName})`);
+          }
+        } catch {}
+      }
+
+      // ── Bulk Campaign Analytics: reply tracking ──
+      // When a customer sends a message, check if they were in a recent bulk campaign (last 7 days)
+      if (!isFromMe && phone) {
+        try {
+          const recipMappings = (await kv.get(`bulk_recipient:${phone}`)) as any[];
+          if (Array.isArray(recipMappings) && recipMappings.length > 0) {
+            const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+            for (const mapping of recipMappings) {
+              if (!mapping?.campaignId || mapping.sentAt < sevenDaysAgo) continue;
+              const statsKey = `bulk_stats:${mapping.campaignId}`;
+              const stats = (await kv.get(statsKey)) as any;
+              if (stats && !stats.repliedPhones?.includes(phone)) {
+                stats.replied = (stats.replied || 0) + 1;
+                stats.repliedPhones = [...(stats.repliedPhones || []), phone];
+                await kv.set(statsKey, stats);
+                console.log(`[BulkAnalytics] REPLY from ${phone} → campaign ${mapping.campaignId}, total replies=${stats.replied}`);
+              }
+            }
+          }
+        } catch {}
+      }
 
       // ── AI Analysis + Auto-Reply ──
       if (!isFromMe && messageText) {
@@ -1336,6 +1555,27 @@ function normalizeNumerals(str: string): string {
   return str.replace(/[\u0660-\u0669]/g, (c) => String(c.charCodeAt(0) - 0x0660))
             .replace(/[\u06F0-\u06F9]/g, (c) => String(c.charCodeAt(0) - 0x06F0));
 }
+
+// ─────────────────────────────────────────────
+// SETTINGS: Daily send limit
+// ─────────────────────────────────────────────
+app.get("/make-server-5c5dc789/settings/daily-limit", async (c) => {
+  try {
+    const limit = parseInt((await kv.get("settings:daily_limit") as any) || "0") || 0;
+    const today = new Date().toISOString().slice(0, 10);
+    const sentToday = parseInt((await kv.get(`bulk_daily:${today}`) as any) || "0") || 0;
+    return c.json({ limit, sentToday, date: today });
+  } catch (e) { return c.json({ error: String(e) }, 500); }
+});
+
+app.post("/make-server-5c5dc789/settings/daily-limit", async (c) => {
+  try {
+    const { limit } = await c.req.json();
+    const val = Math.max(0, parseInt(limit) || 0);
+    await kv.set("settings:daily_limit", String(val));
+    return c.json({ ok: true, limit: val });
+  } catch (e) { return c.json({ error: String(e) }, 500); }
+});
 
 app.post("/make-server-5c5dc789/evolution/config", async (c) => {
   try {
@@ -2548,6 +2788,24 @@ app.post("/make-server-5c5dc789/bulk-message/send", async (c) => {
       // The API adds the JID suffix internally
       const phoneFormatted = phone;
 
+      // ── Personalization ──
+      let personalizedMessage = message;
+      if (personalizedMessage.includes("{{")) {
+        try {
+          const customerId = await kv.get(`customer_phone:${phone}`);
+          let customerName = "";
+          if (customerId) {
+            const customer = await kv.get(`customer:${customerId}`) as any;
+            customerName = customer?.name || "";
+          }
+          const firstName = customerName ? customerName.split(/\s+/)[0] : "";
+          personalizedMessage = personalizedMessage
+            .replace(/\{\{name\}\}/gi, customerName || rawPhone)
+            .replace(/\{\{first_name\}\}/gi, firstName || rawPhone)
+            .replace(/\{\{phone\}\}/gi, rawPhone);
+        } catch (_) {}
+      }
+
       // Send message using correct payload structure (discovered from test-send)
       let sent = false;
       let lastError = "";
@@ -2555,7 +2813,7 @@ app.post("/make-server-5c5dc789/bulk-message/send", async (c) => {
       if (imageUrl && imageUrl.trim().length > 0) {
         // Send image with caption - try raw number first, then with JID
         const mediaPayloads = [
-          { number: phoneFormatted, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: message.trim() } },
+          { number: phoneFormatted, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: personalizedMessage.trim() } },
           { number: phoneFormatted, media: imageUrl.trim(), caption: message.trim(), mediatype: "image" },
           { number: `${phoneFormatted}@s.whatsapp.net`, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: message.trim() } },
         ];
@@ -2578,8 +2836,8 @@ app.post("/make-server-5c5dc789/bulk-message/send", async (c) => {
       } else {
         // Send text only - try raw number first, then with JID suffix
         const textPayloads = [
-          { number: phoneFormatted, text: message.trim() },
-          { number: `${phoneFormatted}@s.whatsapp.net`, text: message.trim() },
+          { number: phoneFormatted, text: personalizedMessage.trim() },
+          { number: `${phoneFormatted}@s.whatsapp.net`, text: personalizedMessage.trim() },
         ];
 
         for (const payload of textPayloads) {
@@ -2772,39 +3030,98 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
       if (!stopKey) return false;
       try { const val = await kv.get(stopKey); return !!val; } catch { return false; }
     };
-    // Helper: pick a random message variant
+    // Helper: pick a random message variant — avoids repeating the same variant twice in a row
+    let lastVariantIndex = -1;
     const pickMessage = (): string => {
       if (allMessages.length === 1) return allMessages[0];
-      return allMessages[Math.floor(Math.random() * allMessages.length)];
+      let idx: number;
+      if (allMessages.length === 2) {
+        idx = lastVariantIndex === 0 ? 1 : 0; // alternate
+      } else {
+        do { idx = Math.floor(Math.random() * allMessages.length); } while (idx === lastVariantIndex);
+      }
+      lastVariantIndex = idx;
+      return allMessages[idx];
+    };
+
+    // Helper: human-like inter-message delay (non-uniform, with occasional "distraction" spikes)
+    // Distribution: 65% normal range · 20% slightly longer (1.3-1.8x) · 10% long (2-3x) · 5% very long (3-5x)
+    const humanDelay = (minSec: number, maxSec: number, msgLength = 0): number => {
+      const base = minSec + Math.random() * (maxSec - minSec);
+      // Slight typing-time influence: longer messages → user "reads" it longer before sending next
+      const typingBonus = Math.min(msgLength / 200, 1.5); // max +1.5s for long messages
+      const r = Math.random();
+      let multiplier = 1;
+      if (r > 0.95) {
+        multiplier = 3 + Math.random() * 2; // 5%: very long "distracted" pause (3x-5x)
+      } else if (r > 0.85) {
+        multiplier = 2 + Math.random();     // 10%: long pause (2x-3x)
+      } else if (r > 0.65) {
+        multiplier = 1.3 + Math.random() * 0.5; // 20%: slightly longer (1.3x-1.8x)
+      } else {
+        // 65%: normal range but with slight sub-second jitter to avoid robotic round numbers
+        multiplier = 0.85 + Math.random() * 0.3; // 0.85x-1.15x
+      }
+      const result = (base + typingBonus) * multiplier;
+      // Clamp: never go below 5s or above (maxSec * 6) in human mode
+      return Math.max(5, Math.min(result, maxSec * 6));
+    };
+
+    // Helper: human-like batch rest (slightly varied, sometimes user comes back early)
+    const humanBatchRest = (minSec: number, maxSec: number): number => {
+      const r = Math.random();
+      if (r < 0.15) {
+        // 15%: user comes back early (60-80% of min)
+        return minSec * (0.6 + Math.random() * 0.2);
+      } else if (r > 0.85) {
+        // 15%: user takes longer (max + 20-50%)
+        return maxSec * (1.2 + Math.random() * 0.3);
+      } else {
+        // 70%: normal range with smooth random
+        return minSec + Math.random() * (maxSec - minSec);
+      }
     };
 
     const encoder = new TextEncoder();
-    // Track client disconnection
-    let cancelled = false;
+    // Track client disconnection — campaign ALWAYS continues even if client disconnects
+    let clientGone = false;
 
     const stream = new ReadableStream({
       async start(controller) {
-        // Safe send — silently stops if client disconnected
-        // critical=true means a send failure should set cancelled (e.g., result, done events)
-        // critical=false means a send failure is logged but doesn't kill the campaign (e.g., countdown ticks)
-        const send = (eventData: any, critical = true): boolean => {
-          if (cancelled) return false;
+        // Safe send — silently skips if client disconnected, but campaign keeps running
+        const send = (eventData: any, _critical = true): boolean => {
+          if (clientGone) return false;
           try {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(eventData)}\n\n`));
             return true;
-          } catch (e) {
-            if (critical) {
-              console.log("[BulkStream] Client disconnected on critical send, stopping writes");
-              cancelled = true;
-            } else {
-              console.log(`[BulkStream] Non-critical send failed (type=${eventData?.type}), continuing`);
-            }
+          } catch {
+            console.log(`[BulkStream] Client disconnected (type=${eventData?.type}), campaign continues in background`);
+            clientGone = true;
             return false;
           }
         };
 
+        // ── Daily Rate Limit check ──
+        const dailyLimitRaw = await kv.get("settings:daily_limit") as any;
+        const dailyLimit: number = parseInt(dailyLimitRaw) || 0; // 0 = unlimited
+        if (dailyLimit > 0) {
+          const today = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+          const sentTodayRaw = await kv.get(`bulk_daily:${today}`) as any;
+          const sentToday: number = parseInt(sentTodayRaw) || 0;
+          const remaining = dailyLimit - sentToday;
+          if (remaining <= 0) {
+            send({ type: "error", message: `Daily limit reached (${dailyLimit} messages/day). Try again tomorrow.` });
+            controller.close();
+            return;
+          }
+          if (total > remaining) {
+            send({ type: "warning", message: `Daily limit: only ${remaining} of ${total} will be sent today (limit: ${dailyLimit}/day)` });
+            finalPhoneNumbers.splice(remaining); // trim to remaining quota
+          }
+        }
+
         const campaignStartedAt = Date.now();
-        send({ type: "start", total, sessionId, humanMode, batchSize: humanMode ? batchSize : total, shuffled: shuffleNumbers, variants: allMessages.length, startedAt: new Date().toISOString(), message: `Starting send to ${total} recipients${humanMode ? " (Human Mode)" : ""}...` });
+        send({ type: "start", total: finalPhoneNumbers.length, sessionId, humanMode, batchSize: humanMode ? batchSize : finalPhoneNumbers.length, shuffled: shuffleNumbers, variants: allMessages.length, startedAt: new Date().toISOString(), message: `Starting send to ${finalPhoneNumbers.length} recipients${humanMode ? " (Human Mode)" : ""}...` });
 
         const results: Array<{ phone: string; success: boolean; error?: string; skipped?: boolean; messageUsed?: string }> = [];
         let successCount = 0;
@@ -2814,13 +3131,22 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
         let autoStopped = false;
         let manuallyStopped = false;
 
-        for (let i = 0; i < total; i++) {
-          // Abort loop if client disconnected
-          if (cancelled) {
-            console.log(`[BulkStream] Client gone at index ${i}/${total}, stopping loop`);
-            break;
-          }
+        // Generate campaignId BEFORE the loop so we can link message IDs to it
+        const campaignId = uuid();
 
+        // Initialize campaign analytics stats
+        if (sessionId) {
+          try {
+            await kv.set(`bulk_stats:${campaignId}`, {
+              campaignId,
+              delivered: 0, read: 0, replied: 0,
+              deliveredPhones: [], readPhones: [], repliedPhones: [],
+              createdAt: new Date().toISOString(),
+            });
+          } catch {}
+        }
+
+        for (let i = 0; i < total; i++) {
           // Check for manual stop
           if (await checkStop()) {
             manuallyStopped = true;
@@ -2833,11 +3159,28 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
           if (humanMode && i > 0 && i % batchSize === 0) {
             const batchNumber = Math.floor(i / batchSize);
             const totalBatches = Math.ceil(total / batchSize);
-            const restDuration = Math.floor(Math.random() * (batchRestMax - batchRestMin + 1) + batchRestMin) * 1000;
+            const restDuration = Math.round(humanBatchRest(batchRestMin, batchRestMax) * 1000);
             console.log(`[BulkStream] Batch ${batchNumber}/${totalBatches} complete. Resting ${restDuration / 1000}s...`);
             send({ type: "batch_rest", batchNumber, totalBatches, restDuration, nextBatchStart: i });
+            // Reconnect: update KV to reflect batch_rest phase
+            if (sessionId) {
+              try {
+                await kv.set(`bulk_active:${sessionId}`, {
+                  sessionId, total, sent: i, successCount, failCount, skipCount,
+                  progress: Math.round((i / total) * 100),
+                  phase: "batch_rest",
+                  batchNumber, totalBatches,
+                  batchRestDuration: restDuration,
+                  humanMode,
+                  messagePreview: message.substring(0, 80),
+                  startedAt: new Date(campaignStartedAt).toISOString(),
+                  lastUpdated: Date.now(),
+                  results,
+                });
+              } catch {}
+            }
             const restStart = Date.now();
-            while (Date.now() - restStart < restDuration && !cancelled) {
+            while (Date.now() - restStart < restDuration) {
               if (await checkStop()) {
                 manuallyStopped = true;
                 send({ type: "campaign_stopped", reason: "manual_during_rest", index: i, total, successCount, failCount, skipCount, elapsedSeconds: Math.round((Date.now() - campaignStartedAt) / 1000) });
@@ -2853,9 +3196,9 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
               send({ type: "batch_countdown", remaining, batchNumber, totalBatches }, false);
               await new Promise((resolve) => setTimeout(resolve, 5000));
             }
-            if (manuallyStopped || cancelled) break;
+            if (manuallyStopped) break;
             // Notify frontend that batch rest ended and sending is about to resume
-            if (!manuallyStopped && !cancelled) {
+            if (!manuallyStopped) {
               console.log(`[BulkStream] Batch ${batchNumber} rest ended, resuming...`);
               send({ type: "batch_rest_end", batchNumber, totalBatches, nextIndex: i });
             }
@@ -2889,7 +3232,25 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
           }
 
           // Pick message for this recipient (spinning)
-          const currentMessage = pickMessage();
+          let currentMessage = pickMessage();
+
+          // ── Personalization: resolve {{name}}, {{first_name}}, {{phone}} ──
+          if (currentMessage.includes("{{")) {
+            try {
+              const customerId = await kv.get(`customer_phone:${phone}`);
+              let customerName = "";
+              if (customerId) {
+                const customer = await kv.get(`customer:${customerId}`) as any;
+                customerName = customer?.name || "";
+              }
+              const firstName = customerName ? customerName.split(/\s+/)[0] : "";
+              const displayPhone = rawPhone;
+              currentMessage = currentMessage
+                .replace(/\{\{name\}\}/gi, customerName || displayPhone)
+                .replace(/\{\{first_name\}\}/gi, firstName || displayPhone)
+                .replace(/\{\{phone\}\}/gi, displayPhone);
+            } catch (_) {}
+          }
 
           send({
             type: "sending", index: i, total, phone: rawPhone,
@@ -2915,6 +3276,7 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
           let sent = false;
           let lastError = "";
           let wasSkipped = false;
+          let sentMsgId = "";
 
           // Send with 30s timeout + skip/stop polling
           const ac = new AbortController();
@@ -2941,8 +3303,11 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
                 if (ac.signal.aborted) break;
                 try {
                   const res = await evoFetch(baseUrl, config.apiKey, `/message/sendMedia/${instanceEnc}`, "POST", payload, ac.signal);
-                  if (res.ok) { sent = true; break; }
-                  else {
+                  if (res.ok) {
+                    sent = true;
+                    try { const rd = await res.json(); sentMsgId = rd?.key?.id || rd?.message?.key?.id || ""; } catch {}
+                    break;
+                  } else {
                     const errText = await res.text();
                     lastError = `${res.status}: ${errText.substring(0, 100)}`;
                   }
@@ -2968,8 +3333,11 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
                 if (ac.signal.aborted) break;
                 try {
                   const res = await evoFetch(baseUrl, config.apiKey, `/message/sendText/${instanceEnc}`, "POST", payload, ac.signal);
-                  if (res.ok) { sent = true; break; }
-                  else {
+                  if (res.ok) {
+                    sent = true;
+                    try { const rd = await res.json(); sentMsgId = rd?.key?.id || rd?.message?.key?.id || ""; } catch {}
+                    break;
+                  } else {
                     const errText = await res.text();
                     lastError = `${res.status}: ${errText.substring(0, 100)}`;
                   }
@@ -3005,6 +3373,24 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
             successCount++;
             consecutiveConnectionErrors = 0;
             results.push({ phone: rawPhone, success: true, messageUsed: currentMessage });
+            // Increment daily counter
+            try {
+              const today = new Date().toISOString().slice(0, 10);
+              const dKey = `bulk_daily:${today}`;
+              const prev = parseInt((await kv.get(dKey) as any) || "0") || 0;
+              await kv.set(dKey, String(prev + 1));
+            } catch (_) {}
+            // Analytics: save message ID → campaign mapping for delivery/read tracking
+            try {
+              if (sentMsgId) {
+                await kv.set(`bulk_msgid:${sentMsgId}`, { campaignId, phone: rawPhone, sentAt: Date.now() });
+              }
+              // Save phone → campaign mapping for reply tracking (keep last 5 campaigns per phone)
+              const recipKey = `bulk_recipient:${rawPhone}`;
+              const existing = (await kv.get(recipKey)) || [];
+              const updated = [{ campaignId, sentAt: Date.now() }, ...existing].slice(0, 5);
+              await kv.set(recipKey, updated);
+            } catch {}
           } else {
             failCount++;
             if (wasSkipped) skipCount++;
@@ -3028,18 +3414,48 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
             batchNumber: humanMode ? Math.floor(i / batchSize) + 1 : undefined,
           });
 
+          // ── Reconnect: save live snapshot to KV after every message ──
+          if (sessionId) {
+            try {
+              await kv.set(`bulk_active:${sessionId}`, {
+                sessionId,
+                total,
+                sent: i + 1,
+                successCount,
+                failCount,
+                skipCount,
+                progress: Math.round(((i + 1) / total) * 100),
+                phase: "sending",
+                batchNumber: humanMode ? Math.floor(i / batchSize) + 1 : undefined,
+                totalBatches: humanMode ? Math.ceil(total / batchSize) : undefined,
+                humanMode,
+                messagePreview: message.substring(0, 80),
+                startedAt: new Date(campaignStartedAt).toISOString(),
+                lastUpdated: Date.now(),
+                results,
+              });
+            } catch {}
+          }
+
           // Interruptible delay between messages
-          if (i < total - 1 && !cancelled && !manuallyStopped && !autoStopped) {
+          if (i < total - 1 && !manuallyStopped && !autoStopped) {
             // In human mode, skip inter-message delay if next message starts a new batch
             if (humanMode && (i + 1) % batchSize === 0) {
               // batch rest will handle it
             } else {
               const effectiveMinDelay = humanMode ? Math.max(minDelay, 8) : minDelay;
               const effectiveMaxDelay = humanMode ? Math.max(maxDelay, 15) : maxDelay;
-              const randomDelay = Math.floor(Math.random() * (effectiveMaxDelay - effectiveMinDelay + 1) + effectiveMinDelay) * 1000;
+              // Human mode "micro-burst": 8% chance to send next message quickly (2-5s) — simulates
+              // someone rapidly scrolling through contacts and sending while in a rhythm
+              const isMicroBurst = humanMode && Math.random() < 0.08;
+              const randomDelay = humanMode
+                ? isMicroBurst
+                  ? Math.round((2 + Math.random() * 3) * 1000) // micro-burst: 2-5s
+                  : Math.round(humanDelay(effectiveMinDelay, effectiveMaxDelay, currentMessage.length) * 1000)
+                : Math.floor(Math.random() * (effectiveMaxDelay - effectiveMinDelay + 1) + effectiveMinDelay) * 1000;
               send({ type: "waiting", index: i, delayMs: randomDelay, nextPhone: finalPhoneNumbers[i + 1] });
               const delayStart = Date.now();
-              while (Date.now() - delayStart < randomDelay && !cancelled) {
+              while (Date.now() - delayStart < randomDelay) {
                 if (await checkStop()) {
                   manuallyStopped = true;
                   send({ type: "campaign_stopped", reason: "manual_during_delay", index: i, total, successCount, failCount, skipCount, elapsedSeconds: Math.round((Date.now() - campaignStartedAt) / 1000) });
@@ -3058,7 +3474,7 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
         }
 
         // Always save campaign results (even if client disconnected)
-        const campaignId = uuid();
+        // Note: campaignId was already generated before the loop
         const elapsedSeconds = Math.round((Date.now() - campaignStartedAt) / 1000);
         try {
           await kv.set(`bulk_campaign:${campaignId}`, {
@@ -3068,6 +3484,13 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
             messageVariants: allMessages.length > 1 ? allMessages : undefined,
             imageUrl,
             humanMode,
+            // Save sending settings so Resume Campaign can restore them exactly
+            batchSize: humanMode ? batchSize : undefined,
+            batchRestMin: humanMode ? batchRestMin : undefined,
+            batchRestMax: humanMode ? batchRestMax : undefined,
+            minDelay,
+            maxDelay,
+            shuffleNumbers: humanMode ? shuffleNumbers : undefined,
             totalRecipients: total,
             successCount,
             failCount,
@@ -3085,6 +3508,30 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
         if (stopKey) { try { await kv.del(stopKey); } catch {} }
         if (skipKey) { try { await kv.del(skipKey); } catch {} }
 
+        // Reconnect: mark final state in KV so reconnecting clients see completion
+        const finalPhase = manuallyStopped ? "stopped" : autoStopped ? "auto_stopped" : "done";
+        if (sessionId) {
+          try {
+            await kv.set(`bulk_active:${sessionId}`, {
+              sessionId, total, sent: results.length,
+              successCount, failCount, skipCount,
+              progress: 100,
+              phase: finalPhase,
+              humanMode,
+              messagePreview: message.substring(0, 80),
+              startedAt: new Date(campaignStartedAt).toISOString(),
+              lastUpdated: Date.now(),
+              campaignId,
+              elapsedSeconds,
+              results,
+            });
+            // Auto-clean after 5 minutes — client has had time to see the result
+            setTimeout(async () => {
+              try { await kv.del(`bulk_active:${sessionId}`); } catch {}
+            }, 5 * 60 * 1000);
+          } catch {}
+        }
+
         send({
           type: "done", campaignId, total,
           successCount, failCount, skipCount,
@@ -3093,16 +3540,16 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
           progress: 100, results,
         });
 
-        console.log(`[BulkStream] Complete: ${successCount} success, ${failCount} failed, ${skipCount} skipped, autoStopped=${autoStopped}, manuallyStopped=${manuallyStopped}, cancelled=${cancelled}`);
+        console.log(`[BulkStream] Complete: ${successCount} success, ${failCount} failed, ${skipCount} skipped, autoStopped=${autoStopped}, manuallyStopped=${manuallyStopped}, clientGone=${clientGone}`);
         // Safely close the controller
-        if (!cancelled) {
+        if (!clientGone) {
           try { controller.close(); } catch {}
         }
       },
       cancel() {
-        // Called by Deno when the client disconnects
-        console.log("[BulkStream] Stream cancelled — client disconnected");
-        cancelled = true;
+        // Called when the client disconnects — campaign continues running in background
+        console.log("[BulkStream] Client disconnected — campaign continues in background");
+        clientGone = true;
       },
     });
 
@@ -3168,6 +3615,44 @@ app.get("/make-server-5c5dc789/bulk-message/campaigns", async (c) => {
   } catch (error) {
     console.log("Campaigns get error:", error);
     return c.json({ error: `Campaigns get error: ${error}` }, 500);
+  }
+});
+
+// ─────────────────────────────────────────────
+// BULK MESSAGING: Campaign Analytics Stats
+// ─────────────────────────────────────────────
+app.get("/make-server-5c5dc789/bulk-message/campaigns/:id/stats", async (c) => {
+  try {
+    const { id } = c.req.param();
+    const stats = await kv.get(`bulk_stats:${id}`);
+    if (!stats) return c.json({ stats: { delivered: 0, read: 0, replied: 0, deliveredPhones: [], readPhones: [], repliedPhones: [] } });
+    return c.json({ stats });
+  } catch (e) {
+    return c.json({ stats: { delivered: 0, read: 0, replied: 0, deliveredPhones: [], readPhones: [], repliedPhones: [] } });
+  }
+});
+
+// ─────────────────────────────────────────────
+// BULK MESSAGING: Active Session — Reconnect support
+// Returns the most recently updated in-progress campaign so the frontend
+// can re-attach and show live progress after a browser refresh/close.
+// ─────────────────────────────────────────────
+app.get("/make-server-5c5dc789/bulk-message/active-session", async (c) => {
+  try {
+    const sessions = await kv.getByPrefix("bulk_active:");
+    if (!sessions.length) return c.json({ session: null });
+
+    // Filter to sessions updated in the last 15 minutes
+    const cutoff = Date.now() - 15 * 60 * 1000;
+    const recent = sessions.filter((s: any) => s && s.lastUpdated > cutoff);
+    if (!recent.length) return c.json({ session: null });
+
+    // Return most recently updated session
+    recent.sort((a: any, b: any) => b.lastUpdated - a.lastUpdated);
+    return c.json({ session: recent[0] });
+  } catch (e) {
+    console.log("[ActiveSession] Error:", e);
+    return c.json({ session: null });
   }
 });
 
@@ -4863,6 +5348,105 @@ app.delete("/make-server-5c5dc789/contact-groups/:id", async (c) => {
 });
 
 // ─────────────────────────────────────────────
+// CUSTOMERS: CRM-lite — list, create, update, delete, bulk-delete
+// ─────────────────────────────────────────────
+app.get("/make-server-5c5dc789/customers", async (c) => {
+  try {
+    const customers = await kv.getByPrefix("customer:");
+    const sorted = customers.sort((a: any, b: any) =>
+      new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+    return c.json({ customers: sorted });
+  } catch (error) {
+    return c.json({ error: `Customers get error: ${error}` }, 500);
+  }
+});
+
+// Helper: upsert a customer and maintain reverse phone index
+async function upsertCustomer(opts: { id?: string; name: string; phone: string; tags?: string[]; notes?: string; source?: string }): Promise<string> {
+  const cleanPhone = opts.phone.replace(/[^0-9]/g, "");
+  const customerId = opts.id || uuid();
+  const existing = opts.id ? await kv.get(`customer:${customerId}`) as any : null;
+  await kv.set(`customer:${customerId}`, {
+    id: customerId,
+    name: opts.name.trim(),
+    phone: cleanPhone,
+    tags: Array.isArray(opts.tags) ? opts.tags.map(t => t.trim()).filter(Boolean) : [],
+    notes: (opts.notes || "").trim(),
+    source: opts.source || "manual",
+    createdAt: existing?.createdAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+  // Maintain reverse phone → customerId index for O(1) webhook lookup
+  await kv.set(`customer_phone:${cleanPhone}`, customerId);
+  return customerId;
+}
+
+app.post("/make-server-5c5dc789/customers", async (c) => {
+  try {
+    const body = await c.req.json();
+    const { id, name, phone, tags = [], notes = "" } = body;
+    if (!name?.trim()) return c.json({ error: "Name is required" }, 400);
+    if (!phone?.trim()) return c.json({ error: "Phone is required" }, 400);
+    const customerId = await upsertCustomer({ id, name, phone, tags, notes, source: "manual" });
+    return c.json({ status: "ok", id: customerId });
+  } catch (error) {
+    return c.json({ error: `Customer save error: ${error}` }, 500);
+  }
+});
+
+app.post("/make-server-5c5dc789/customers/bulk-import", async (c) => {
+  try {
+    const body = await c.req.json();
+    const { customers: rows = [] } = body;
+    if (!Array.isArray(rows) || rows.length === 0) return c.json({ error: "No customers provided" }, 400);
+    let imported = 0;
+    let skipped = 0;
+    for (const row of rows) {
+      const name = (row.name || "").trim();
+      const phone = (row.phone || "").toString().trim().replace(/[^0-9]/g, "");
+      if (phone.length < 7) { skipped++; continue; }
+      // Skip if phone already exists
+      const existingId = await kv.get(`customer_phone:${phone}`);
+      if (existingId) { skipped++; continue; }
+      await upsertCustomer({
+        name: name || phone,
+        phone,
+        tags: Array.isArray(row.tags) ? row.tags : (row.tags ? [String(row.tags)] : []),
+        notes: (row.notes || "").trim(),
+        source: "import",
+      });
+      imported++;
+    }
+    return c.json({ status: "ok", imported, skipped });
+  } catch (error) {
+    return c.json({ error: `Bulk import error: ${error}` }, 500);
+  }
+});
+
+app.delete("/make-server-5c5dc789/customers/:id", async (c) => {
+  try {
+    const id = c.req.param("id");
+    const customer = await kv.get(`customer:${id}`) as any;
+    await kv.del(`customer:${id}`);
+    if (customer?.phone) await kv.del(`customer_phone:${customer.phone}`);
+    return c.json({ status: "ok" });
+  } catch (error) {
+    return c.json({ error: `Customer delete error: ${error}` }, 500);
+  }
+});
+
+app.post("/make-server-5c5dc789/customers/bulk-delete", async (c) => {
+  try {
+    const { ids = [] } = await c.req.json();
+    if (ids.length > 0) await kv.mdel(ids.map((id: string) => `customer:${id}`));
+    return c.json({ status: "ok", deleted: ids.length });
+  } catch (error) {
+    return c.json({ error: `Bulk delete error: ${error}` }, 500);
+  }
+});
+
+// ─────────────────────────────────────────────
 // BULK MESSAGING: Delete a campaign from history
 // ─────────────────────────────────────────────
 app.delete("/make-server-5c5dc789/bulk-message/campaigns/:id", async (c) => {
@@ -5637,6 +6221,196 @@ app.post("/make-server-5c5dc789/inbox/send", async (c) => {
 });
 
 // ─────────────────────────────────────────────
+// SCHEDULED BULK CAMPAIGNS
+// ─────────────────────────────────────────────
+
+/** Map of scheduled campaign id → NodeJS timer handle (for cancellation) */
+const scheduledTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** Actually trigger a scheduled campaign — calls the same logic as send-stream but without SSE */
+async function fireBulkScheduled(id: string) {
+  try {
+    const item = await kv.get(`bulk_scheduled:${id}`) as any;
+    if (!item || item.status !== "pending") return;
+
+    // Mark as running
+    await kv.set(`bulk_scheduled:${id}`, { ...item, status: "running", startedAt: new Date().toISOString() });
+    scheduledTimers.delete(id);
+
+    const config = await kv.get("evolution:config") as any;
+    if (!config?.apiUrl || !config?.apiKey || !config?.instanceName) {
+      await kv.set(`bulk_scheduled:${id}`, { ...item, status: "failed", error: "Evolution API not configured" });
+      return;
+    }
+
+    const {
+      phoneNumbers, message, imageUrl = null,
+      minDelay = 2, maxDelay = 5,
+      humanMode = false, batchSize = 5, batchRestMin = 60, batchRestMax = 120,
+      messageVariants = [] as string[], shuffleNumbers = false,
+    } = item;
+
+    const baseUrl = config.apiUrl;
+    const instanceEnc = encodeURIComponent(config.instanceName);
+    const allMessages: string[] = [message, ...(messageVariants || []).filter((v: string) => v?.trim())];
+    const finalNumbers: string[] = shuffleNumbers
+      ? [...phoneNumbers].sort(() => Math.random() - 0.5)
+      : [...phoneNumbers];
+
+    let lastVariantIndex = -1;
+    const pickMsg = (): string => {
+      if (allMessages.length === 1) return allMessages[0];
+      let idx: number;
+      do { idx = Math.floor(Math.random() * allMessages.length); } while (idx === lastVariantIndex && allMessages.length > 1);
+      lastVariantIndex = idx;
+      return allMessages[idx];
+    };
+
+    const humanDelaySched = (mn: number, mx: number, len = 0): number => {
+      const base = mn + Math.random() * (mx - mn);
+      const r = Math.random();
+      const mult = r > 0.95 ? 3 + Math.random() * 2 : r > 0.85 ? 2 + Math.random() : r > 0.65 ? 1.3 + Math.random() * 0.5 : 0.85 + Math.random() * 0.3;
+      return Math.max(5, Math.min((base + Math.min(len / 200, 1.5)) * mult, mx * 6));
+    };
+
+    const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+
+    let success = 0, fail = 0;
+    const campaignId = uuid();
+    await kv.set(`bulk_stats:${campaignId}`, { delivered: 0, read: 0, replied: 0, deliveredPhones: [], readPhones: [], repliedPhones: [] });
+
+    for (let i = 0; i < finalNumbers.length; i++) {
+      const rawPhone = finalNumbers[i].toString().trim();
+      const phone = rawPhone.replace(/[^0-9]/g, "");
+      if (phone.length < 10) { fail++; continue; }
+
+      let currentMessage = pickMsg();
+      // Personalize
+      if (currentMessage.includes("{{")) {
+        try {
+          const custId = await kv.get(`customer_phone:${phone}`);
+          let name = "";
+          if (custId) { const c = await kv.get(`customer:${custId}`) as any; name = c?.name || ""; }
+          currentMessage = currentMessage
+            .replace(/\{\{name\}\}/gi, name || rawPhone)
+            .replace(/\{\{first_name\}\}/gi, name ? name.split(/\s+/)[0] : rawPhone)
+            .replace(/\{\{phone\}\}/gi, rawPhone);
+        } catch (_) {}
+      }
+
+      try {
+        if (imageUrl?.trim()) {
+          const r = await evoFetch(baseUrl, config.apiKey, `/message/sendMedia/${instanceEnc}`, "POST",
+            { number: phone, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: currentMessage.trim() } });
+          if (r.ok) success++; else fail++;
+        } else {
+          const r = await evoFetch(baseUrl, config.apiKey, `/message/sendText/${instanceEnc}`, "POST",
+            { number: phone, text: currentMessage.trim() });
+          if (r.ok) success++; else fail++;
+        }
+      } catch (_) { fail++; }
+
+      // Delay between messages
+      if (i < finalNumbers.length - 1) {
+        const ms = humanMode
+          ? Math.round(humanDelaySched(minDelay, maxDelay, currentMessage.length) * 1000)
+          : Math.round((minDelay + Math.random() * (maxDelay - minDelay)) * 1000);
+        await sleep(ms);
+        // Batch rest
+        if (humanMode && batchSize > 0 && (i + 1) % batchSize === 0) {
+          const rest = Math.round((batchRestMin + Math.random() * (batchRestMax - batchRestMin)) * 1000);
+          await sleep(rest);
+        }
+      }
+    }
+
+    // Save final campaign record
+    await kv.set(`bulk_campaign:${campaignId}`, {
+      id: campaignId, createdAt: new Date().toISOString(), status: "done",
+      total: finalNumbers.length, successCount: success, failCount: fail,
+      message, imageUrl, humanMode, results: [],
+      scheduledId: id,
+    });
+
+    await kv.set(`bulk_scheduled:${id}`, { ...item, status: "done", campaignId, doneAt: new Date().toISOString(), successCount: success, failCount: fail });
+    console.log(`[SCHEDULE] Campaign ${id} done — ${success} sent, ${fail} failed`);
+  } catch (e) {
+    console.error(`[SCHEDULE] fireBulkScheduled error for ${id}:`, e);
+    try {
+      const item = await kv.get(`bulk_scheduled:${id}`) as any;
+      if (item) await kv.set(`bulk_scheduled:${id}`, { ...item, status: "failed", error: String(e) });
+    } catch (_) {}
+  }
+}
+
+// Schedule a new campaign
+app.post("/make-server-5c5dc789/bulk-message/schedule", async (c) => {
+  try {
+    const body = await c.req.json();
+    const { scheduledAt, phoneNumbers, message, imageUrl, minDelay, maxDelay,
+      humanMode, batchSize, batchRestMin, batchRestMax, messageVariants, shuffleNumbers } = body;
+
+    if (!scheduledAt) return c.json({ error: "scheduledAt is required (ISO string)" }, 400);
+    if (!phoneNumbers?.length) return c.json({ error: "No phone numbers provided" }, 400);
+    if (!message?.trim()) return c.json({ error: "Message cannot be empty" }, 400);
+
+    const fireAt = new Date(scheduledAt).getTime();
+    if (isNaN(fireAt)) return c.json({ error: "Invalid scheduledAt date" }, 400);
+    const delay = fireAt - Date.now();
+    if (delay < 0) return c.json({ error: "scheduledAt must be in the future" }, 400);
+
+    const id = uuid();
+    const record = {
+      id, scheduledAt, status: "pending", createdAt: new Date().toISOString(),
+      phoneNumbers, message, imageUrl: imageUrl || null,
+      minDelay: minDelay || 2, maxDelay: maxDelay || 5,
+      humanMode: humanMode || false, batchSize: batchSize || 5,
+      batchRestMin: batchRestMin || 60, batchRestMax: batchRestMax || 120,
+      messageVariants: messageVariants || [], shuffleNumbers: shuffleNumbers || false,
+      total: phoneNumbers.length,
+    };
+    await kv.set(`bulk_scheduled:${id}`, record);
+
+    const timer = setTimeout(() => fireBulkScheduled(id), delay);
+    scheduledTimers.set(id, timer);
+
+    console.log(`[SCHEDULE] Scheduled campaign ${id} at ${scheduledAt} (in ${Math.round(delay / 60000)} min)`);
+    return c.json({ id, scheduledAt, total: phoneNumbers.length });
+  } catch (e) {
+    return c.json({ error: `Schedule error: ${e}` }, 500);
+  }
+});
+
+// List scheduled campaigns
+app.get("/make-server-5c5dc789/bulk-message/scheduled", async (c) => {
+  try {
+    const items = await kv.getByPrefix("bulk_scheduled:");
+    const sorted = (items as any[]).sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return c.json({ scheduled: sorted });
+  } catch (e) {
+    return c.json({ error: String(e) }, 500);
+  }
+});
+
+// Cancel a scheduled campaign
+app.delete("/make-server-5c5dc789/bulk-message/scheduled/:id", async (c) => {
+  try {
+    const { id } = c.req.param();
+    const item = await kv.get(`bulk_scheduled:${id}`) as any;
+    if (!item) return c.json({ error: "Not found" }, 404);
+    if (item.status !== "pending") return c.json({ error: "Can only cancel pending campaigns" }, 400);
+
+    const timer = scheduledTimers.get(id);
+    if (timer) { clearTimeout(timer); scheduledTimers.delete(id); }
+
+    await kv.set(`bulk_scheduled:${id}`, { ...item, status: "cancelled", cancelledAt: new Date().toISOString() });
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ error: String(e) }, 500);
+  }
+});
+
+// ─────────────────────────────────────────────
 // Static files: uploaded images
 // ─────────────────────────────────────────────
 app.use("/uploads/*", serveStatic({ root: "../" }));
@@ -5648,6 +6422,27 @@ const PORT = parseInt(process.env.PORT || "3001");
 
 await initDB();
 console.log(`[DB] MySQL connected — table kv_store ready`);
+
+// ── Restore scheduled campaigns after server restart ──
+(async () => {
+  try {
+    const scheduled = await kv.getByPrefix("bulk_scheduled:");
+    const now = Date.now();
+    let restored = 0;
+    for (const item of scheduled as any[]) {
+      if (item.status !== "pending") continue;
+      const fireAt = new Date(item.scheduledAt).getTime();
+      const delay = Math.max(0, fireAt - now);
+      if (delay > 7 * 24 * 60 * 60 * 1000) continue; // skip if > 7 days away (won't survive restart anyway)
+      setTimeout(() => fireBulkScheduled(item.id), delay);
+      restored++;
+    }
+    if (restored > 0) console.log(`[SCHEDULE] Restored ${restored} scheduled campaign(s)`);
+  } catch (e) {
+    console.error("[SCHEDULE] Restore error:", e);
+  }
+})();
+
 console.log(`[Server] Running on http://localhost:${PORT}`);
 
 serve({ fetch: app.fetch, port: PORT, hostname: "0.0.0.0" });
