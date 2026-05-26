@@ -316,6 +316,35 @@ app.get("/make-server-5c5dc789/health", (c) => {
   return c.json({ status: "ok" });
 });
 
+// ── WhatsApp Real-Time State Endpoints ────────────────────────────────────────
+app.get("/make-server-5c5dc789/whatsapp/connection-state", async (c) => {
+  const state = await kv.get("whatsapp:connection_state");
+  const alerts = (await kv.get("system:alerts") as any[]) || [];
+  return c.json({ state, alerts });
+});
+
+app.get("/make-server-5c5dc789/whatsapp/qr-code", async (c) => {
+  const qr = await kv.get("whatsapp:qr_code");
+  return c.json(qr || { qr: null });
+});
+
+app.get("/make-server-5c5dc789/whatsapp/presence/:phone", async (c) => {
+  const phone = c.req.param("phone");
+  const presence = await kv.get(`presence:${phone}`);
+  return c.json(presence || { status: "unavailable", updatedAt: null });
+});
+
+app.get("/make-server-5c5dc789/whatsapp/calls", async (c) => {
+  const calls = (await kv.get("whatsapp:calls") as any[]) || [];
+  return c.json({ calls });
+});
+
+app.delete("/make-server-5c5dc789/system/alerts", async (c) => {
+  await kv.set("system:alerts", []);
+  return c.json({ status: "ok" });
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ─────────────────────────────────────────────
 // WEBHOOK: Evolution API — GET (health / reachability check)
 // ─────────────────────────────────────────────
@@ -362,16 +391,221 @@ app.post("/make-server-5c5dc789/webhook/evolution", async (c) => {
     const event = payload.event || payload.type || payload.action || "unknown";
     console.log(`[WEBHOOK] Event: "${event}", top-level keys: [${Object.keys(payload).join(", ")}]`);
 
-    // Events we don't process
+    // Events we truly ignore (outgoing send confirmations, irrelevant)
     const ignoredEvents = [
-      "connection.update", "CONNECTION_UPDATE", "qrcode.updated",
-      "presence.update", "PRESENCE_UPDATE", "chats.set", "CHATS_SET",
-      "contacts.update", "CONTACTS_UPDATE", "groups.upsert", "GROUPS_UPSERT",
       "send.message", "SEND_MESSAGE",
+      "groups.upsert", "GROUPS_UPSERT",
+      "group.update", "GROUP_UPDATE",
+      "group_participants.update", "GROUP_PARTICIPANTS_UPDATE",
+      "typebot.change_status", "TYPEBOT_CHANGE_STATUS",
+      "typebot.start", "TYPEBOT_START",
+      "application.startup", "APPLICATION_STARTUP",
     ];
     if (ignoredEvents.includes(event)) {
       console.log(`[WEBHOOK] Event "${event}" ignored`);
       return c.json({ status: "ok", note: `event ${event} ignored` });
+    }
+
+    // ── CONNECTION_UPDATE: track WA connection state ──────────────────────────
+    if (["connection.update", "CONNECTION_UPDATE"].includes(event)) {
+      try {
+        const d = payload.data ?? payload;
+        const state = d?.state || d?.instance?.state || d?.connection || "";
+        const statusReason = d?.statusReason ?? d?.lastDisconnect?.error?.output?.statusCode ?? null;
+        const connEntry = {
+          state,
+          statusReason,
+          updatedAt: new Date().toISOString(),
+        };
+        await kv.set("whatsapp:connection_state", connEntry);
+        console.log(`[WEBHOOK] CONNECTION_UPDATE: state="${state}" reason=${statusReason}`);
+
+        // Push alert if disconnected/banned
+        if (state && state !== "open" && state !== "connected") {
+          const alertMsg = statusReason === 401
+            ? "⚠️ تم تسجيل الخروج من WhatsApp — يرجى إعادة المسح"
+            : statusReason === 403
+            ? "🚫 تم حظر الرقم من WhatsApp"
+            : `⚠️ انقطع اتصال WhatsApp (${state})`;
+          const alert = { id: `conn_${Date.now()}`, type: "connection", message: alertMsg, state, statusReason, at: new Date().toISOString() };
+          const alerts: any[] = (await kv.get("system:alerts") as any[]) || [];
+          alerts.unshift(alert);
+          if (alerts.length > 20) alerts.length = 20;
+          await kv.set("system:alerts", alerts);
+        }
+      } catch (e) { console.log("[WEBHOOK] CONNECTION_UPDATE error:", e); }
+      return c.json({ status: "ok", note: "connection state updated" });
+    }
+
+    // ── QRCODE_UPDATED: store latest QR for dashboard display ────────────────
+    if (["qrcode.updated", "QRCODE_UPDATED"].includes(event)) {
+      try {
+        const d = payload.data ?? payload;
+        const qr = d?.qrcode?.base64 || d?.base64 || d?.qr || d?.code || "";
+        if (qr) {
+          await kv.set("whatsapp:qr_code", { qr, updatedAt: new Date().toISOString() });
+          console.log(`[WEBHOOK] QRCODE_UPDATED: QR stored (${qr.length} chars)`);
+        }
+      } catch (e) { console.log("[WEBHOOK] QRCODE_UPDATED error:", e); }
+      return c.json({ status: "ok", note: "qr stored" });
+    }
+
+    // ── PRESENCE_UPDATE: online/typing status per phone ──────────────────────
+    if (["presence.update", "PRESENCE_UPDATE"].includes(event)) {
+      try {
+        const d = payload.data ?? payload;
+        const jid = d?.id || d?.remoteJid || d?.from || "";
+        const phone = jid.replace(/@.*$/, "").replace(/[^0-9]/g, "");
+        const presences = d?.presences || d?.presence || {};
+        // presences is { "phone@s.whatsapp.net": { lastKnownPresence: "composing"|"available"|"unavailable" } }
+        let presenceStatus = "available";
+        if (typeof presences === "object") {
+          const keys = Object.keys(presences);
+          if (keys.length > 0) presenceStatus = presences[keys[0]]?.lastKnownPresence || "available";
+        } else if (typeof presences === "string") {
+          presenceStatus = presences;
+        }
+        if (phone && phone.length >= 7) {
+          await kv.set(`presence:${phone}`, { status: presenceStatus, updatedAt: new Date().toISOString() });
+          console.log(`[WEBHOOK] PRESENCE_UPDATE: ${phone} → ${presenceStatus}`);
+        }
+      } catch (e) { console.log("[WEBHOOK] PRESENCE_UPDATE error:", e); }
+      return c.json({ status: "ok", note: "presence updated" });
+    }
+
+    // ── CALL: incoming call alert ─────────────────────────────────────────────
+    if (["call", "CALL"].includes(event)) {
+      try {
+        const items = Array.isArray(payload.data) ? payload.data : [payload.data ?? payload];
+        for (const d of items) {
+          const from = (d?.from || d?.callFrom || "").replace(/@.*$/, "").replace(/[^0-9]/g, "");
+          const callId = d?.id || d?.callId || `call_${Date.now()}`;
+          const status = d?.status || "incoming";
+          if (from) {
+            const callEntry = { id: callId, from, status, at: new Date().toISOString() };
+            const calls: any[] = (await kv.get("whatsapp:calls") as any[]) || [];
+            calls.unshift(callEntry);
+            if (calls.length > 50) calls.length = 50;
+            await kv.set("whatsapp:calls", calls);
+            console.log(`[WEBHOOK] CALL: from=${from} status=${status}`);
+          }
+        }
+      } catch (e) { console.log("[WEBHOOK] CALL error:", e); }
+      return c.json({ status: "ok", note: "call logged" });
+    }
+
+    // ── CONTACTS_UPSERT / CONTACTS_UPDATE: auto-sync customers ───────────────
+    if (["contacts.upsert", "CONTACTS_UPSERT", "contacts.update", "CONTACTS_UPDATE", "contacts.set", "CONTACTS_SET"].includes(event)) {
+      try {
+        const items: any[] = Array.isArray(payload.data) ? payload.data
+          : Array.isArray(payload.data?.contacts) ? payload.data.contacts
+          : [payload.data ?? payload];
+        let newCount = 0;
+        for (const contact of items) {
+          const jid = contact?.id || contact?.remoteJid || contact?.jid || "";
+          if (!jid.includes("@s.whatsapp.net")) continue;
+          const phone = jid.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "");
+          if (!phone || phone.length < 7) continue;
+          const name = contact?.name || contact?.pushName || contact?.notify || contact?.verifiedName || phone;
+          // Only create customer if doesn't exist
+          const existingId = await kv.get(`customer_phone:${phone}`);
+          if (!existingId) {
+            const custId = `cust_${Date.now()}_${phone.slice(-4)}`;
+            const customer = { id: custId, name, phone, tags: [], notes: "", createdAt: new Date().toISOString() };
+            await kv.set(`customer:${custId}`, customer);
+            await kv.set(`customer_phone:${phone}`, custId);
+            newCount++;
+          }
+        }
+        console.log(`[WEBHOOK] ${event}: processed ${items.length} contacts, ${newCount} new`);
+      } catch (e) { console.log(`[WEBHOOK] ${event} error:`, e); }
+      return c.json({ status: "ok", note: "contacts synced" });
+    }
+
+    // ── CHATS_UPSERT / CHATS_UPDATE / CHATS_SET: update conversation metadata ─
+    if (["chats.upsert", "CHATS_UPSERT", "chats.update", "CHATS_UPDATE", "chats.set", "CHATS_SET"].includes(event)) {
+      try {
+        const items: any[] = Array.isArray(payload.data) ? payload.data
+          : Array.isArray(payload.data?.chats) ? payload.data.chats
+          : [payload.data ?? payload];
+        for (const chat of items) {
+          const jid = chat?.id || chat?.remoteJid || chat?.jid || "";
+          if (!jid.includes("@s.whatsapp.net")) continue;
+          const phone = jid.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "");
+          if (!phone || phone.length < 7) continue;
+          const allConvs = await kv.getByPrefix("conversation:");
+          const conv = allConvs.find((cv: any) => cv.customer_phone === phone);
+          if (conv) {
+            // Update unread count and last message time if available
+            const updates: any = {};
+            if (chat.unreadCount != null) updates.unread_count = chat.unreadCount;
+            if (chat.updatedAt || chat.t) updates.last_message_at = chat.updatedAt || new Date(Number(chat.t) * 1000).toISOString();
+            if (Object.keys(updates).length > 0) {
+              await kv.set(`conversation:${conv.id}`, { ...conv, ...updates });
+            }
+          }
+        }
+        console.log(`[WEBHOOK] ${event}: processed ${items.length} chats`);
+      } catch (e) { console.log(`[WEBHOOK] ${event} error:`, e); }
+      return c.json({ status: "ok", note: "chats updated" });
+    }
+
+    // ── MESSAGES_DELETE: remove message from inbox ────────────────────────────
+    if (["messages.delete", "MESSAGES_DELETE"].includes(event)) {
+      try {
+        const items: any[] = Array.isArray(payload.data) ? payload.data : [payload.data ?? payload];
+        for (const d of items) {
+          const msgKeyId = d?.key?.id || d?.id || d?.messageId || "";
+          if (!msgKeyId) continue;
+          // Find and delete message by msgKeyId across all conversations
+          const allMsgs = await kv.getByPrefix("cmsg:");
+          for (const msg of allMsgs as any[]) {
+            if (msg?.payload?.msgKeyId === msgKeyId) {
+              await kv.del(`cmsg:${msg.conversation_id}:${msg.id}`);
+              console.log(`[WEBHOOK] MESSAGES_DELETE: deleted msg ${msgKeyId}`);
+              break;
+            }
+          }
+          // Also clean dedup entry
+          await kv.del(`msgdedup:${msgKeyId}`);
+        }
+      } catch (e) { console.log("[WEBHOOK] MESSAGES_DELETE error:", e); }
+      return c.json({ status: "ok", note: "messages deleted" });
+    }
+
+    // ── LABELS_ASSOCIATION / LABELS_EDIT: sync WhatsApp labels as customer tags ─
+    if (["labels.association", "LABELS_ASSOCIATION", "labels.edit", "LABELS_EDIT"].includes(event)) {
+      try {
+        const d = payload.data ?? payload;
+        const labelName = d?.label?.name || d?.name || "";
+        const labelId = d?.label?.id || d?.labelId || d?.id || "";
+        const jid = d?.contact?.id || d?.remoteJid || d?.jid || "";
+        if (labelName && jid.includes("@s.whatsapp.net")) {
+          const phone = jid.replace("@s.whatsapp.net", "").replace(/[^0-9]/g, "");
+          const custId = await kv.get(`customer_phone:${phone}`) as string;
+          if (custId) {
+            const customer = await kv.get(`customer:${custId}`) as any;
+            if (customer) {
+              const tags: string[] = customer.tags || [];
+              const action = d?.action || "add"; // "add" or "remove"
+              if (action === "add" && !tags.includes(labelName)) {
+                tags.push(labelName);
+              } else if (action === "remove") {
+                const idx = tags.indexOf(labelName);
+                if (idx >= 0) tags.splice(idx, 1);
+              }
+              await kv.set(`customer:${custId}`, { ...customer, tags });
+              console.log(`[WEBHOOK] LABELS: ${action} label "${labelName}" to ${phone}`);
+            }
+          }
+        } else if (["labels.edit", "LABELS_EDIT"].includes(event) && labelId && labelName) {
+          // Store label definitions for reference
+          const labels: any = (await kv.get("whatsapp:labels")) || {};
+          labels[labelId] = labelName;
+          await kv.set("whatsapp:labels", labels);
+        }
+      } catch (e) { console.log("[WEBHOOK] LABELS error:", e); }
+      return c.json({ status: "ok", note: "label synced" });
     }
 
     // ── Bulk Campaign Analytics: delivery / read receipts ──
