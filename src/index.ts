@@ -3951,6 +3951,8 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
           } else {
             failCount++;
             if (wasSkipped) skipCount++;
+            // Log every failure with full error for debugging
+            console.log(`[BulkStream] ❌ FAILED phone=${rawPhone} error="${lastError || "Unknown"}" wasSkipped=${wasSkipped}`);
             results.push({ phone: rawPhone, success: false, error: lastError || "Unknown error", skipped: wasSkipped, messageUsed: currentMessage });
             // Track consecutive connection errors for auto-stop
             const lowerErr = (lastError || "").toLowerCase();
