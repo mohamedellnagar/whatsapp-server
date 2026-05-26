@@ -3776,9 +3776,12 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
           let networkRetryCount = 0;
           const MAX_NETWORK_RETRIES = 2;
 
-          // Send with 30s timeout + skip/stop polling
+          // Send with timeout + skip/stop polling
+          // humanMode adds typing simulation (~8s) + openChat (~1.5s) before actual send
+          // so we extend timeout to 60s in humanMode to avoid premature abort
+          const SEND_TIMEOUT_MS = humanMode ? 60000 : 30000;
           const ac = new AbortController();
-          const timeoutId = setTimeout(() => ac.abort(), 30000);
+          const timeoutId = setTimeout(() => ac.abort(), SEND_TIMEOUT_MS);
           let skipPollBusy = false;
           const skipPoll = setInterval(async () => {
             if (skipPollBusy) return; // prevent overlapping checks
@@ -3849,7 +3852,7 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
                     if (isStop) { manuallyStopped = true; lastError = "تم إيقاف الحملة"; break; }
                     const isSkip = await checkSkip();
                     if (isSkip) { wasSkipped = true; await clearSkip(); lastError = "تم التخطي يدوياً"; }
-                    else { lastError = "تجاوز المهلة (30 ثانية)"; }
+                    else { lastError = "تجاوز المهلة الزمنية"; }
                     break;
                   }
                   lastError = e.message || String(e);
@@ -3880,7 +3883,7 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
                     else {
                       const isSkip = await checkSkip();
                       if (isSkip) { wasSkipped = true; await clearSkip(); lastError = "تم التخطي يدوياً"; }
-                      else { lastError = "تجاوز المهلة (30 ثانية)"; }
+                      else { lastError = "تجاوز المهلة الزمنية"; }
                     }
                     break;
                   } else {
