@@ -3864,6 +3864,7 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
                 { number: phoneFormatted, text: currentMessage },
                 { number: `${phoneFormatted}@s.whatsapp.net`, text: currentMessage },
               ];
+              console.log(`[BulkStream] Sending to ${phoneFormatted}, instance="${config.instanceName}", instanceEnc="${instanceEnc}", baseUrl="${baseUrl}"`);
               for (const payload of textPayloads) {
                 if (ac.signal.aborted) break;
                 try {
@@ -3874,7 +3875,8 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
                     break;
                   } else {
                     const errText = await res.text();
-                    lastError = `${res.status}: ${errText.substring(0, 100)}`;
+                    lastError = `${res.status}: ${errText.substring(0, 200)}`;
+                    console.log(`[BulkStream] ❌ sendText failed: ${lastError} | payload=${JSON.stringify(payload)}`);
                   }
                 } catch (e: any) {
                   if (ac.signal.aborted) {
