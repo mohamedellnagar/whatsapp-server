@@ -983,6 +983,24 @@ app.get("/make-server-5c5dc789/dashboard/live", async (c) => {
     const ordersToday = todayOrders.length;
     const revenueToday = todayOrders.reduce((sum: number, o: any) => sum + (o.total_amount || 0), 0);
 
+    // Average First Response Time (minutes) — today's conversations only
+    const todayConvs = conversations.filter((cv: any) => cv.created_at && cv.created_at >= today);
+    const frtValues: number[] = [];
+    for (const conv of todayConvs) {
+      const convMsgs = messages
+        .filter((m: any) => m.conversation_id === conv.id)
+        .sort((a: any, b: any) => new Date(a.sent_at).getTime() - new Date(b.sent_at).getTime());
+      const firstIn = convMsgs.find((m: any) => m.direction === "inbound");
+      const firstOut = convMsgs.find((m: any) => m.direction === "outbound");
+      if (firstIn && firstOut) {
+        const diff = (new Date(firstOut.sent_at).getTime() - new Date(firstIn.sent_at).getTime()) / 60000;
+        if (diff >= 0 && diff < 1440) frtValues.push(diff);
+      }
+    }
+    const avgResponseTime = frtValues.length > 0
+      ? Math.round(frtValues.reduce((s, v) => s + v, 0) / frtValues.length)
+      : null;
+
     // Recent messages (last 20) — kept for backward compat
     const recentMessages = messages
       .sort((a: any, b: any) => new Date(b.sent_at).getTime() - new Date(a.sent_at).getTime())
@@ -1044,6 +1062,7 @@ app.get("/make-server-5c5dc789/dashboard/live", async (c) => {
       pendingWithoutReply,
       ordersToday,
       revenueToday: Math.round(revenueToday * 100) / 100,
+      avgResponseTime,
       totalConversations: conversations.length,
       recentMessages,
       recentConversations,
@@ -6909,6 +6928,22 @@ async function fireBulkScheduled(id: string) {
     } catch (_) {}
   }
 }
+
+// Resolve / reopen a conversation
+app.post("/make-server-5c5dc789/conversations/:id/resolve", async (c) => {
+  try {
+    const id = c.req.param("id");
+    const { status = "resolved" } = await c.req.json().catch(() => ({}));
+    const conv = await kv.get(`conversation:${id}`) as any;
+    if (!conv) return c.json({ error: "Conversation not found" }, 404);
+    conv.status = status;
+    conv.resolved_at = status === "resolved" ? new Date().toISOString() : null;
+    await kv.set(`conversation:${id}`, conv);
+    return c.json({ success: true, status });
+  } catch (e) {
+    return c.json({ error: String(e) }, 500);
+  }
+});
 
 // Schedule a new campaign
 app.post("/make-server-5c5dc789/bulk-message/schedule", async (c) => {
