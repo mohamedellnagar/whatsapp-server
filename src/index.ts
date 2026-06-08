@@ -3266,11 +3266,11 @@ app.post("/make-server-5c5dc789/bulk-message/send", async (c) => {
       let lastError = "";
 
       if (imageUrl && imageUrl.trim().length > 0) {
-        // Send image with caption - try raw number first, then with JID
+        // Send image with caption — flat format first (this Evolution API instance
+        // rejects the nested "mediaMessage" wrapper), JID as fallback
         const mediaPayloads = [
-          { number: phoneFormatted, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: personalizedMessage.trim() } },
-          { number: phoneFormatted, media: imageUrl.trim(), caption: message.trim(), mediatype: "image" },
-          { number: `${phoneFormatted}@s.whatsapp.net`, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: message.trim() } },
+          { number: phoneFormatted, media: imageUrl.trim(), caption: personalizedMessage.trim(), mediatype: "image" },
+          { number: `${phoneFormatted}@s.whatsapp.net`, media: imageUrl.trim(), caption: personalizedMessage.trim(), mediatype: "image" },
         ];
         
         for (const payload of mediaPayloads) {
@@ -3847,11 +3847,13 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
 
           try {
             if (imageUrl && imageUrl.trim().length > 0) {
-              // Try raw number first, then with JID suffix as fallback
+              // Flat format first — this Evolution API instance rejects the nested
+              // "mediaMessage" wrapper with "instance requires property \"mediatype\""
+              // (a JSON-schema error where "instance" means "request body", not the
+              // WhatsApp instance — it was being misread as an instance-name problem).
               const mediaPayloads = [
-                { number: phoneFormatted, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: currentMessage } },
                 { number: phoneFormatted, media: imageUrl.trim(), caption: currentMessage, mediatype: "image" },
-                { number: `${phoneFormatted}@s.whatsapp.net`, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: currentMessage } },
+                { number: `${phoneFormatted}@s.whatsapp.net`, media: imageUrl.trim(), caption: currentMessage, mediatype: "image" },
               ];
               for (const payload of mediaPayloads) {
                 if (ac.signal.aborted) break;
@@ -4476,10 +4478,10 @@ app.post("/make-server-5c5dc789/bulk-message/test-send", async (c) => {
 
     const payloadVariants = imageUrl && imageUrl.trim().length > 0 
       ? [
-          { number: phoneRaw, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: message.trim() } },
           { number: phoneRaw, media: imageUrl.trim(), caption: message.trim(), mediatype: "image" },
-          { number: phoneJid, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: message.trim() } },
           { number: phoneJid, media: imageUrl.trim(), caption: message.trim(), mediatype: "image" },
+          { number: phoneRaw, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: message.trim() } },
+          { number: phoneJid, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: message.trim() } },
         ]
       : [
           { number: phoneRaw, text: message.trim() },
@@ -6886,8 +6888,9 @@ async function fireBulkScheduled(id: string) {
 
       try {
         if (imageUrl?.trim()) {
+          // Flat format — this Evolution API instance rejects the nested "mediaMessage" wrapper
           const r = await evoFetch(baseUrl, config.apiKey, `/message/sendMedia/${instanceEnc}`, "POST",
-            { number: phone, mediaMessage: { mediatype: "image", media: imageUrl.trim(), caption: currentMessage.trim() } });
+            { number: phone, media: imageUrl.trim(), caption: currentMessage.trim(), mediatype: "image" });
           if (r.ok) success++; else fail++;
         } else {
           const r = await evoFetch(baseUrl, config.apiKey, `/message/sendText/${instanceEnc}`, "POST",
