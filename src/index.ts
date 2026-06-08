@@ -7018,7 +7018,7 @@ app.delete("/make-server-5c5dc789/bulk-message/scheduled/:id", async (c) => {
 // ─────────────────────────────────────────────
 // Static files: uploaded images
 // ─────────────────────────────────────────────
-app.use("/uploads/*", serveStatic({ root: "../" }));
+app.use("/uploads/*", serveStatic({ root: "./" }));
 
 // ─────────────────────────────────────────────
 // Start server
