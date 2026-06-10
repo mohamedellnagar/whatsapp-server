@@ -3392,6 +3392,7 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
       safeHoursTimezone = "Asia/Riyadh",
       validateNumbers = false,
       openChatBeforeSend = false,
+      newNumberDailyLimit = 0, // 0 = unlimited; caps how many never-contacted numbers can be messaged per day
     } = body;
 
     if (!Array.isArray(phoneNumbers) || phoneNumbers.length === 0) {
@@ -3643,6 +3644,9 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
         let failCount = 0;
         let skipCount = 0;
         let consecutiveConnectionErrors = 0;
+        let cooldownAttempts = 0;
+        const MAX_COOLDOWN_ATTEMPTS = 2;
+        const COOLDOWN_DURATION_MS = 12 * 60 * 1000; // 12 minutes
         let autoStopped = false;
         let manuallyStopped = false;
 
@@ -3719,13 +3723,60 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
             }
           }
 
-          // Auto-stop on 3 consecutive connection closed errors
+          // On 3 consecutive connection closed errors: cooldown + recheck connection,
+          // and resume automatically if it recovers (instead of stopping permanently).
           if (humanMode && consecutiveConnectionErrors >= 3) {
-            autoStopped = true;
             const lastErrDetail = results.length > 0 ? results[results.length - 1]?.error || "" : "";
-            console.log(`[BulkStream] Auto-stopped: 3 consecutive connection errors at index ${i}`);
-            send({ type: "auto_stopped", reason: "3_consecutive_connection_errors", index: i, total, successCount, failCount, skipCount, elapsedSeconds: Math.round((Date.now() - campaignStartedAt) / 1000), message: `تم اكتشاف 3 أخطاء اتصال متتالية. آخر خطأ: ${lastErrDetail}` });
-            break;
+            if (cooldownAttempts >= MAX_COOLDOWN_ATTEMPTS) {
+              autoStopped = true;
+              console.log(`[BulkStream] Auto-stopped: connection still down after ${MAX_COOLDOWN_ATTEMPTS} cooldown attempts at index ${i}`);
+              send({ type: "auto_stopped", reason: "connection_unrecoverable", index: i, total, successCount, failCount, skipCount, elapsedSeconds: Math.round((Date.now() - campaignStartedAt) / 1000), message: `الاتصال لسه مقطوع بعد ${MAX_COOLDOWN_ATTEMPTS} محاولات استئناف. آخر خطأ: ${lastErrDetail}` });
+              break;
+            }
+
+            cooldownAttempts++;
+            const cooldownMs = COOLDOWN_DURATION_MS;
+            console.log(`[BulkStream] 3 consecutive connection errors at index ${i}. Cooldown attempt ${cooldownAttempts}/${MAX_COOLDOWN_ATTEMPTS} — waiting ${cooldownMs / 1000}s...`);
+            send({ type: "cooldown_start", attempt: cooldownAttempts, maxAttempts: MAX_COOLDOWN_ATTEMPTS, durationMs: cooldownMs, index: i, total, successCount, failCount, skipCount, elapsedSeconds: Math.round((Date.now() - campaignStartedAt) / 1000), message: `تم اكتشاف 3 أخطاء اتصال متتالية. آخر خطأ: ${lastErrDetail}. جاري الانتظار ${Math.round(cooldownMs / 60000)} دقيقة ثم إعادة المحاولة...` });
+
+            const cooldownStart = Date.now();
+            while (Date.now() - cooldownStart < cooldownMs) {
+              if (await checkStop()) {
+                manuallyStopped = true;
+                send({ type: "campaign_stopped", reason: "manual_during_cooldown", index: i, total, successCount, failCount, skipCount, elapsedSeconds: Math.round((Date.now() - campaignStartedAt) / 1000) });
+                break;
+              }
+              const elapsed = Date.now() - cooldownStart;
+              const remaining = Math.max(0, cooldownMs - elapsed);
+              send({ type: "cooldown_countdown", remaining, attempt: cooldownAttempts, maxAttempts: MAX_COOLDOWN_ATTEMPTS }, false);
+              await new Promise((resolve) => setTimeout(resolve, 5000));
+            }
+            if (manuallyStopped) break;
+
+            // Recheck connection state
+            let recovered = false;
+            try {
+              const csRes = await evoFetch(baseUrl, config.apiKey, `/instance/connectionState/${instanceEnc}`, "GET");
+              if (csRes.ok) {
+                const csData = await csRes.json();
+                const cs = csData?.instance?.state || csData?.instance?.connectionStatus || csData?.state || "";
+                recovered = cs === "open" || cs === "connected";
+              }
+            } catch {}
+
+            if (recovered) {
+              consecutiveConnectionErrors = 0;
+              console.log(`[BulkStream] Connection recovered after cooldown ${cooldownAttempts}. Resuming at index ${i}...`);
+              send({ type: "cooldown_end", recovered: true, attempt: cooldownAttempts, index: i, message: "تم استعادة الاتصال — جاري استئناف الإرسال..." });
+              i--; // retry the same phone that failed
+              continue;
+            } else {
+              console.log(`[BulkStream] Connection still down after cooldown ${cooldownAttempts}.`);
+              send({ type: "cooldown_end", recovered: false, attempt: cooldownAttempts, index: i, message: "الاتصال لسه غير متاح..." });
+              consecutiveConnectionErrors = 0; // reset window, will re-trigger after 3 more failures or exhaust attempts
+              i--; // retry the same phone — if it fails again it'll re-trigger cooldown
+              continue;
+            }
           }
 
           const rawPhone = finalPhoneNumbers[i].toString().trim();
@@ -3786,6 +3837,34 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
             continue;
           }
 
+          // ── Daily New-Number Limit (Human Mode) ──────────────────────────────
+          // Cap how many never-contacted-before numbers get messaged per day,
+          // to ramp up gradually with new contacts and avoid WhatsApp flags.
+          if (humanMode && newNumberDailyLimit > 0) {
+            const firstContactKey = `bulk_first_contact:${phone}`;
+            const isNewNumber = !(await kv.get(firstContactKey));
+            if (isNewNumber) {
+              const today = new Date().toISOString().slice(0, 10);
+              const newCountKey = `bulk_new_today:${today}`;
+              const newCountRaw = await kv.get(newCountKey) as any;
+              const newCount = parseInt(newCountRaw) || 0;
+              if (newCount >= newNumberDailyLimit) {
+                skipCount++;
+                failCount++;
+                results.push({ phone: rawPhone, success: false, error: `تم تأجيل الرقم — تم الوصول للحد اليومي للأرقام الجديدة (${newNumberDailyLimit})`, skipped: true });
+                send({
+                  type: "result", index: i, total, phone: rawPhone,
+                  success: false, error: `تم تأجيل الرقم (رقم جديد) — الحد اليومي ${newNumberDailyLimit} تم الوصول إليه`, skipped: true,
+                  successCount, failCount, skipCount,
+                  progress: Math.round(((i + 1) / total) * 100),
+                });
+                continue;
+              }
+              await kv.set(newCountKey, newCount + 1);
+              await kv.set(firstContactKey, { firstContactAt: new Date().toISOString() });
+            }
+          }
+
           // Evolution API v2 expects raw phone number WITHOUT @s.whatsapp.net
           const phoneFormatted = phone;
           let sent = false;
@@ -3825,23 +3904,14 @@ app.post("/make-server-5c5dc789/bulk-message/send-stream", async (c) => {
           }
 
           // ── Typing Simulation (Human Mode) ──────────────────────────────────
-          // Send "composing" presence before the message, then pause for a realistic
-          // typing duration based on message length. This mimics a real human typing.
+          // NOTE: chat/presence returns 404 on this Evolution API version (not
+          // supported), so we just pause briefly to mimic typing time without
+          // making a doomed extra request on every message.
           if (humanMode) {
-            try {
-              const presenceJid = `${phoneFormatted}@s.whatsapp.net`;
-              // Start composing
-              await evoFetch(baseUrl, config.apiKey, `/chat/presence/${instanceEnc}`, "POST",
-                { number: presenceJid, options: { presence: "composing", delay: 1200 } });
-              // Wait: simulate typing time — ~40 chars/sec, min 1.5s max 6s
-              const typingMs = Math.min(6000, Math.max(1500,
-                Math.floor((currentMessage.length / 40) * 1000) + Math.floor(Math.random() * 800)
-              ));
-              await new Promise(r => setTimeout(r, typingMs));
-              // Stop composing (paused)
-              await evoFetch(baseUrl, config.apiKey, `/chat/presence/${instanceEnc}`, "POST",
-                { number: presenceJid, options: { presence: "paused", delay: 500 } });
-            } catch (_) { /* presence not supported — continue without it */ }
+            const typingMs = Math.min(6000, Math.max(1500,
+              Math.floor((currentMessage.length / 40) * 1000) + Math.floor(Math.random() * 800)
+            ));
+            await new Promise(r => setTimeout(r, typingMs));
           }
           // ────────────────────────────────────────────────────────────────────
 
